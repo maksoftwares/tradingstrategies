@@ -112,7 +112,7 @@ input bool     Dynamic_Spread_Cap     = true;   // dynamic spread cap using ATR
 input double   Spread_ATR_Fraction    = 0.35;   // allowed spread = % of ATR (points)
 input int      HardSpreadCapPts       = 700;    // absolute safety ceiling
 input bool     Stage2_IgnoresSpread   = false;  // bypass spread check at stage 2 when no trades yet
-input bool     Enhanced_Session_Filter= true;   // refined session rules (DISABLED for 24h trading)
+input bool     Enhanced_Session_Filter= false;  // refined session rules (DISABLED for 24h trading)
 input int      LondonNY_Start_Hour    = 6;      // Session start (0=all day)
 input int      LondonNY_End_Hour      = 20;     // Session end (24=all day)
 input bool     Skip_Monday_Asian      = true;   // DISABLED for more opportunities
@@ -191,6 +191,10 @@ input int      EarlyAbort_Bars          = 3;      // If adverse move reaches 0.6
 input bool     Enable_Equity_Filter     = true;   // Sliding window equity filter gate before entries.
 input int      Equity_WinRate_Window    = 10;     // Trades window for equity/winrate filter.
 input double   Equity_Min_WinRate       = 0.33;   // If win rate in the last N trades falls below, pause entries until next day.
+
+input bool     Enable_MinLot_Probe      = true;
+input int      Probe_Fire_Hour          = 16;
+input double   Probe_Max_Spread_ATR_Frac= 0.30;
 
 input group "=== Compression Gate ==="
 input double CI_Min_L0 = 0.80;  // Stage0: require at least mild compression
@@ -292,6 +296,12 @@ bool RiskBudgetOK();
 bool QuotaEnvironmentOK();
 bool AtrRegimeAcceptable();
 bool EnforceProbeTrade();
+double GetVolDigits(double step);
+bool NormalizeVolume(double &vol);
+bool SafeOrderSend(MqlTradeRequest &rq, MqlTradeResult &rs);
+bool PlacePendingOrMarket(bool isLong, double lots, double pendPrice, double sl, double tp, const string tag);
+bool ProbeAllowed();
+bool TryProbeEntry();
 
 void DiagnosticsPrintSummary(){
    if(!Enable_Diagnostics) return;
@@ -466,6 +476,7 @@ bool EnforceProbeTrade(){
    double useStopPts = MathMax((double)stopLevel+5.0, ATR_SL_mult * atrPts);
    probeStopPts = useStopPts;
    double lots = LotsFromRisk(useStopPts) * Probe_Risk_Factor;
+   NormalizeVolume(lots);
    if(lots <= 0.0) return false;
    double sl_buy  = NormalizePrice(ask - PriceFromPoints(useStopPts));
    double sl_sell = NormalizePrice(bid + PriceFromPoints(useStopPts));
@@ -477,12 +488,12 @@ bool EnforceProbeTrade(){
    if(wantLong){
       rq.type=ORDER_TYPE_BUY_STOP; rq.price=NormalizePrice(m15[1].high + PriceFromPoints(12));
       if(PointsFromPrice(rq.price-ask) < stopLevel+10) rq.price=NormalizePrice(ask+PriceFromPoints(stopLevel+10));
-      rq.sl=sl_buy; rq.tp=tp_buy; if(OrderSend(rq,rs)){ pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=1; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=useStopPts; entryATRPoints=atrPts; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; partialTaken=false; secondPartialTaken=false; probeBarsSinceEntry=0; probeEntries++; return true; }
+      rq.sl=sl_buy; rq.tp=tp_buy; if(SafeOrderSend(rq,rs)){ pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=1; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=useStopPts; entryATRPoints=atrPts; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; partialTaken=false; secondPartialTaken=false; probeBarsSinceEntry=0; probeEntries++; return true; }
    }
    if(wantShort){
       rq.type=ORDER_TYPE_SELL_STOP; rq.price=NormalizePrice(m15[1].low - PriceFromPoints(12));
       if(PointsFromPrice(bid-rq.price) < stopLevel+10) rq.price=NormalizePrice(bid-PriceFromPoints(stopLevel+10));
-      rq.sl=sl_sell; rq.tp=tp_sell; if(OrderSend(rq,rs)){ pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=0; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=useStopPts; entryATRPoints=atrPts; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; partialTaken=false; secondPartialTaken=false; probeBarsSinceEntry=0; probeEntries++; return true; }
+      rq.sl=sl_sell; rq.tp=tp_sell; if(SafeOrderSend(rq,rs)){ pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=0; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=useStopPts; entryATRPoints=atrPts; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; partialTaken=false; secondPartialTaken=false; probeBarsSinceEntry=0; probeEntries++; return true; }
    }
    return false;
 }
@@ -682,6 +693,7 @@ bool EnforceDailyTradeQuota(){
       lots = stepLot * MathFloor(lots/stepLot + 0.5);
    lots = MathMax(minLot, MathMin(baseLots, lots));
    if(lots <= 0.0) return false;
+   NormalizeVolume(lots);
 
    double sl_buy  = NormalizePrice(ask - PriceFromPoints(useStopPts));
    double sl_sell = NormalizePrice(bid + PriceFromPoints(useStopPts));
@@ -701,7 +713,7 @@ bool EnforceDailyTradeQuota(){
          rq.price = NormalizePrice(ask + PriceFromPoints(stopLevel+10));
       rq.sl = sl_buy;
       rq.tp = tp_buy;
-      if(OrderSend(rq,rs))
+      if(SafeOrderSend(rq,rs))
       {
          pendingTicket=rs.order;
          pendingExpiryBars=PendingOrder_Expiry_Bars;
@@ -730,7 +742,7 @@ bool EnforceDailyTradeQuota(){
          rq.price = NormalizePrice(bid - PriceFromPoints(stopLevel+10));
       rq.sl = sl_sell;
       rq.tp = tp_sell;
-      if(OrderSend(rq,rs))
+      if(SafeOrderSend(rq,rs))
       {
          pendingTicket=rs.order;
          pendingExpiryBars=PendingOrder_Expiry_Bars;
@@ -949,6 +961,7 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
       double lots=LotsByRiskSafe(stopPts);
       lots = ApplyFailSafeRisk(lots, failSafeActive);
       if(lots<=0){ AppendReason(why,"noLots"); return LogAndReturnFalse(why); }
+      NormalizeVolume(lots);
       double sl=NormalizePrice(ask-stopDistPrice);
       double tpR=TP2_R;
       double tp=NormalizePrice(ask+PriceFromPoints(stopPts*tpR));
@@ -957,7 +970,7 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
          if(PointsFromPrice(pendingPrice-ask) < stopLevel+10) pendingPrice=NormalizePrice(ask+PriceFromPoints(stopLevel+10));
          MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
          rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_BUY_STOP; rq.symbol=_Symbol; rq.volume=lots; rq.price=pendingPrice; rq.sl=sl; rq.tp=tp; rq.magic=Magic; rq.deviation=50; rq.type_filling=ORDER_FILLING_FOK;
-         if(OrderSend(rq,rs)){
+         if(SafeOrderSend(rq,rs)){
             pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=1; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=stopPts; entryATRPoints=atrPts; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; probeStopPts=0.0; probeBarsSinceEntry=0; return true;
          } else AppendReason(why,"buyStopFail");
       } else {
@@ -980,6 +993,7 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
       double lots=LotsByRiskSafe(stopPts);
       lots = ApplyFailSafeRisk(lots, failSafeActive);
       if(lots<=0){ AppendReason(why,"noLots"); return LogAndReturnFalse(why); }
+      NormalizeVolume(lots);
       double sl=NormalizePrice(bid+stopDistPrice);
       double tpR=TP2_R; double tp=NormalizePrice(bid-PriceFromPoints(stopPts*tpR));
       if(UseStopOrders){
@@ -987,7 +1001,7 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
          if(PointsFromPrice(bid - pendingPrice) < stopLevel+10) pendingPrice=NormalizePrice(bid-PriceFromPoints(stopLevel+10));
          MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
          rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_SELL_STOP; rq.symbol=_Symbol; rq.volume=lots; rq.price=pendingPrice; rq.sl=sl; rq.tp=tp; rq.magic=Magic; rq.deviation=50; rq.type_filling=ORDER_FILLING_FOK;
-         if(OrderSend(rq,rs)){
+         if(SafeOrderSend(rq,rs)){
             pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=0; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=stopPts; entryATRPoints=atrPts; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; probeStopPts=0.0; probeBarsSinceEntry=0; return true;
          } else AppendReason(why,"sellStopFail");
       } else {
@@ -1063,6 +1077,7 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
          double lotsAlt = LotsByRiskSafe(stopPts);
          lotsAlt = ApplyFailSafeRisk(lotsAlt, failSafeActive);
          if(lotsAlt>0){
+            NormalizeVolume(lotsAlt);
             bool usePending = Alt_UseStopOrders || (Bracket_UseStops && failSafeActive);
             if(usePending){
                double hi1=m15[1].high, lo1=m15[1].low;
@@ -1089,7 +1104,7 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
                   if(PointsFromPrice(rq.price-ask2)<stopLevel2+10)
                      rq.price=NormalizePrice(ask2+PriceFromPoints(stopLevel2+10));
                   rq.sl=slLong; rq.tp=0; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK;
-                  if(OrderSend(rq,rs)){
+                  if(SafeOrderSend(rq,rs)){
                      pendingTicket=rs.order;
                      pendingExpiryBars=PendingOrder_Expiry_Bars;
                      pendingDirection=1;
@@ -1105,7 +1120,7 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
                   if(PointsFromPrice(bid2-rq.price)<stopLevel2+10)
                      rq.price=NormalizePrice(bid2-PriceFromPoints(stopLevel2+10));
                   rq.sl=slShort; rq.tp=0; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK;
-                  if(OrderSend(rq,rs)){
+                  if(SafeOrderSend(rq,rs)){
                      pendingTicket=rs.order;
                      pendingExpiryBars=PendingOrder_Expiry_Bars;
                      pendingDirection=0;
@@ -1130,6 +1145,8 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
       if(EnforceProbeTrade()) return true;
    }
 
+   if(TryProbeEntry()) return true;
+
    // If we reach here, no entry was possible
    return LogAndReturnFalse(why);
 }
@@ -1141,8 +1158,50 @@ bool LogAndReturnFalse(const string why){
    return false;
 }
 
+double GetVolDigits(double step)
+{
+   if(step<=0.0) return 2;
+   return (int)MathRound(-MathLog10(step));
+}
+
+bool NormalizeVolume(double &vol)
+{
+   double minV = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxV = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(minV<=0 || step<=0){ minV=0.01; step=0.01; }
+   vol = MathMax(minV, MathMin(maxV, MathCeil(vol/step)*step));
+   vol = NormalizeDouble(vol, (int)GetVolDigits(step));
+   return (vol >= minV && vol <= maxV);
+}
+
+bool SafeOrderSend(MqlTradeRequest &rq, MqlTradeResult &rs)
+{
+   MqlTradeCheckResult cr;
+   if(!OrderCheck(rq, cr)){
+      if(cr.retcode == TRADE_RETCODE_INVALID_VOLUME){
+         double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+         if(step<=0) step=0.01;
+         rq.volume = rq.volume + step;
+         NormalizeVolume(rq.volume);
+      } else {
+         return false;
+      }
+   }
+   return OrderSend(rq, rs);
+}
+
 double LotsFromRisk(double stopPts){
-   return LotsByRiskSafe(stopPts);
+   double lots = LotsByRiskSafe(stopPts);
+   double minLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   if(minLot<=0 || lotStep<=0){ minLot=0.01; lotStep=0.01; }
+   lots = MathMax(minLot, MathMin(maxLot, lots));
+   lots = MathCeil(lots/lotStep)*lotStep;
+   NormalizeVolume(lots);
+   if(lots < minLot) lots = minLot;
+   return lots;
 }
 
 // Compute lot size from % risk and stop distance (in points)
@@ -1192,6 +1251,58 @@ double LotsByRiskSafe(double stopPts){
    lots = MathMax(minLot, MathMin(MathMin(maxLot, MaxRiskLotsCap), lots));
 
    return NormalizeDouble(lots,2);
+}
+
+bool PlacePendingOrMarket(bool isLong, double lots, double pendPrice, double sl, double tp, const string tag)
+{
+   NormalizeVolume(lots);
+   MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
+   rq.action=TRADE_ACTION_PENDING;
+   rq.type = (isLong? ORDER_TYPE_BUY_STOP: ORDER_TYPE_SELL_STOP);
+   rq.symbol=_Symbol; rq.volume=lots; rq.price=pendPrice; rq.sl=sl; rq.tp=tp; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK;
+   if(SafeOrderSend(rq,rs)) return true;
+   CTrade t; t.SetExpertMagicNumber(Magic); t.SetDeviationInPoints(50);
+   bool ok = (isLong? t.Buy(lots, NULL, 0.0, sl, tp, tag) : t.Sell(lots, NULL, 0.0, sl, tp, tag));
+   return ok;
+}
+
+bool ProbeAllowed()
+{
+   if(!Enable_MinLot_Probe) return false;
+   if(TradesToday >= DailyMinTrades) return false;
+   if(HasOpenPosition()) return false;
+   MqlDateTime dt; TimeCurrent(dt);
+   if(dt.hour < Probe_Fire_Hour) return false;
+   return true;
+}
+
+bool TryProbeEntry()
+{
+   if(!ProbeAllowed()) return false;
+   double atr=0.0; if(!GetValue(hATR_M15,0,1,atr)) return false;
+   double atrPts = atr/_Point; if(atrPts<=0) return false;
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK), bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double spreadPts = (ask-bid)/_Point;
+   if(spreadPts > Probe_Max_Spread_ATR_Frac * atrPts) return false;
+   double f=0,s=0, ema50=0, rsi=0, macd=0;
+   if(!GetValue(hEMA_H1_fast,0,1,f) || !GetValue(hEMA_H1_slow,0,1,s)) return false;
+   if(!GetValue(hEMA_M15_struct,0,1,ema50)) return false;
+   if(!GetValue(hRSI_M15,0,1,rsi) || !GetValue(hMACD_M15,0,1,macd)) return false;
+   bool up=(f>s), dn=(f<s);
+   MqlRates m15[3]; if(!GetRates(PERIOD_M15,3,m15)) return false;
+   bool wantLong  = up && (rsi>=50 || macd>0) && (m15[1].close>ema50);
+   bool wantShort = dn && (rsi<=50 || macd<0) && (m15[1].close<ema50);
+   if(!wantLong && !wantShort) return false;
+   double lots = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   NormalizeVolume(lots);
+   int stopLevel=(int)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
+   double useStopPts = MathMax((double)stopLevel+5.0, ATR_SL_mult * atrPts);
+   double sl = (wantLong? NormalizePrice(ask-PriceFromPoints(useStopPts)) : NormalizePrice(bid+PriceFromPoints(useStopPts)));
+   double tp = (wantLong? NormalizePrice(ask+PriceFromPoints(useStopPts*TP2_R)) : NormalizePrice(bid-PriceFromPoints(useStopPts*TP2_R)));
+   double pend = (wantLong? NormalizePrice(m15[1].high + PriceFromPoints(EntryBufferPts)) : NormalizePrice(m15[1].low - PriceFromPoints(EntryBufferPts)));
+   bool ok = PlacePendingOrMarket(wantLong, lots, pend, sl, tp, (wantLong? "ProbeLong" : "ProbeShort"));
+   if(ok){ TradesToday++; return true; }
+   return false;
 }
 
 double ApplyFailSafeRisk(double lots, bool apply){
@@ -1264,9 +1375,10 @@ bool HasOpenPosition(){
 }
 
 bool SessionAllowed(){
+   if(!Use_Session_Filter) return true; // hard bypass to avoid session starvation
    // Stage 2 override: allow entries late in day regardless of session
    if(Stage2_OverrideSession && LoosenStage()==2) return true;
-   
+
    if(Enhanced_Session_Filter){
       MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
       if(Skip_Monday_Asian && dt.day_of_week==1 && dt.hour < Monday_Skip_Until_Hour) return false;
@@ -1274,7 +1386,6 @@ bool SessionAllowed(){
       if(dt.hour < LondonNY_Start_Hour || dt.hour >= LondonNY_End_Hour) return false;
       return true;
    }
-   if(!Use_Session_Filter) return true;
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
    if(Session_Start_Hour <= Session_End_Hour)
       return (dt.hour >= Session_Start_Hour && dt.hour < Session_End_Hour);
@@ -1521,6 +1632,10 @@ void ManagePartialAndTrail(){
 }
 
 int OnInit(){
+   PrintFormat("[VOL] min=%.3f step=%.3f max=%.3f",
+               SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN),
+               SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP),
+               SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX));
    trade.SetExpertMagicNumber(Magic);
    ArrayInitialize(longResults,0);
    ArrayInitialize(shortResults,0);
@@ -1774,11 +1889,32 @@ void OnTick(){
          double lots = LotsByRiskSafe(stopPts);
          lots = ApplyFailSafeRisk(lots, failSafeLegacy);
          if(lots>0){
+            NormalizeVolume(lots);
             entryTP2_R=TP2_R; entryTP3_R=TP3_R; if(Adaptive_R_Targets){ double atrArr[]; ArraySetAsSeries(atrArr,true); int need=MathMax(ATR_Regime_Period,10); if(CopyBuffer(hATR_M15,0,1,need,atrArr)==need){ double sum=0; for(int i=0;i<need;i++) sum+=atrArr[i]; double sma=sum/need; double ratio=(sma>0? atr_1/sma:1.0); if(ratio>HighVolRatio){ entryTP2_R+=HighVol_Target_Boost; entryTP3_R+=HighVol_Target_Boost;} else if(ratio<LowVolRatio){ entryTP2_R-=LowVol_Target_Reduction; entryTP3_R-=LowVol_Target_Reduction;} } if(entryTP2_R < TP1_R+0.1) entryTP2_R=TP1_R+0.1; if(entryTP3_R < entryTP2_R+0.2) entryTP3_R=entryTP2_R+0.2; }
             double finalR = (Use_TP3? entryTP3_R: entryTP2_R);
             double sl = NormalizePrice(ask - stopDistPrice);
             double tp = NormalizePrice(ask + PriceFromPoints(stopPts * finalR));
-            if(Use_Stop_Confirmation){ double pendingPrice=NormalizePrice(m15[1].high + PriceFromPoints(EntryBufferPts)); MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs); rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_BUY_STOP; rq.symbol=_Symbol; rq.volume=lots; rq.price=pendingPrice; rq.sl=sl; rq.tp=tp; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK; if(OrderSend(rq,rs)){ pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=1; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; if(verboseBar) Print("[Diag] Placed BuyStop #",pendingTicket," @",pendingPrice); } }
+            if(Use_Stop_Confirmation){
+               double pendingPrice=NormalizePrice(m15[1].high + PriceFromPoints(EntryBufferPts));
+               NormalizeVolume(lots);
+               if(PlacePendingOrMarket(true, lots, pendingPrice, sl, tp, "LongFB")){
+                  pendingTicket=0;
+                  pendingDirection=-1;
+                  pendingExpiryBars=0;
+                  signalHigh=m15[1].high;
+                  signalLow=m15[1].low;
+                  structureBreakOccurred=false;
+                  beMoved=false;
+                  partialTaken=false;
+                  secondPartialTaken=false;
+                  entryStopPoints=stopPts;
+                  entryATRPoints=atr_points;
+                  entryTime=TimeCurrent();
+                  probeStopPts=0.0;
+                  probeBarsSinceEntry=0;
+                  return true;
+               }
+            }
             else { trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50); if(trade.Buy(lots,NULL,ask,sl,tp,"M15SwingLong")){ partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atr_points; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; } }
          }
       }
@@ -1810,11 +1946,32 @@ void OnTick(){
          double lots = LotsByRiskSafe(stopPts);
          lots = ApplyFailSafeRisk(lots, failSafeLegacy);
          if(lots>0){
+            NormalizeVolume(lots);
             entryTP2_R=TP2_R; entryTP3_R=TP3_R; if(Adaptive_R_Targets){ double atrArr[]; ArraySetAsSeries(atrArr,true); int need=MathMax(ATR_Regime_Period,10); if(CopyBuffer(hATR_M15,0,1,need,atrArr)==need){ double sum=0; for(int i=0;i<need;i++) sum+=atrArr[i]; double sma=sum/need; double ratio=(sma>0? atr_1/sma:1.0); if(ratio>HighVolRatio){ entryTP2_R+=HighVol_Target_Boost; entryTP3_R+=HighVol_Target_Boost;} else if(ratio<LowVolRatio){ entryTP2_R-=LowVol_Target_Reduction; entryTP3_R-=LowVol_Target_Reduction;} } if(entryTP2_R < TP1_R+0.1) entryTP2_R=TP1_R+0.1; if(entryTP3_R < entryTP2_R+0.2) entryTP3_R=entryTP2_R+0.2; }
             double finalR = (Use_TP3? entryTP3_R: entryTP2_R);
             double sl = NormalizePrice(bid + stopDistPrice);
             double tp = NormalizePrice(bid - PriceFromPoints(stopPts * finalR));
-            if(Use_Stop_Confirmation){ double pendingPrice=NormalizePrice(m15[1].low - PriceFromPoints(EntryBufferPts)); MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs); rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_SELL_STOP; rq.symbol=_Symbol; rq.volume=lots; rq.price=pendingPrice; rq.sl=sl; rq.tp=tp; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK; if(OrderSend(rq,rs)){ pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=0; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; if(verboseBar) Print("[Diag] Placed SellStop #",pendingTicket," @",pendingPrice); } }
+            if(Use_Stop_Confirmation){
+               double pendingPrice=NormalizePrice(m15[1].low - PriceFromPoints(EntryBufferPts));
+               NormalizeVolume(lots);
+               if(PlacePendingOrMarket(false, lots, pendingPrice, sl, tp, "ShortFB")){
+                  pendingTicket=0;
+                  pendingDirection=-1;
+                  pendingExpiryBars=0;
+                  signalHigh=m15[1].high;
+                  signalLow=m15[1].low;
+                  structureBreakOccurred=false;
+                  beMoved=false;
+                  partialTaken=false;
+                  secondPartialTaken=false;
+                  entryStopPoints=stopPts;
+                  entryATRPoints=atr_points;
+                  entryTime=TimeCurrent();
+                  probeStopPts=0.0;
+                  probeBarsSinceEntry=0;
+                  return true;
+               }
+            }
             else { trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50); if(trade.Sell(lots,NULL,bid,sl,tp,"M15SwingShort")){ partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atr_points; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; } }
          }
       }
@@ -1823,6 +1980,8 @@ void OnTick(){
       else DiagnosticsCount("trend");
       if(verboseBar) Print("[Diag] Short reject tDn=",trendDown," below=",belowStruct," pull=",touchedPullShort," mom=",momentumShortOK," bear=",bearCandle," ext=",DoubleToString(extensionATR,2));
    }
+
+   if(TryProbeEntry()) return true;
 
    // pending order expiry (evaluate once per bar)
    if(pendingTicket>0){
