@@ -459,7 +459,7 @@ bool ComputeRecentWinrate(int lookback, double &wr_out)
    datetime to=TimeCurrent(), from=to-86400*120; // 120d window
    if(!HistorySelect(from,to)) return false;
    int wins=0, total=0;
-   uint deals=HistoryDealsTotal();
+   int deals=(int)HistoryDealsTotal();
    for(int i=deals-1; i>=0 && total<lookback; --i){
       ulong ticket=HistoryDealGetTicket(i);
       if(!HistoryDealSelect(ticket)) continue;
@@ -577,7 +577,7 @@ double NormalizePrice(double p){
 
 void ResetDailyCounters(){
    MqlDateTime dt;
-   TimeCurrent(dt);
+   TimeToStruct(TimeCurrent(), dt);
    int d = dt.day;
    if(LastTradeDate != d){
       TradesToday = 0;
@@ -678,7 +678,7 @@ int LoosenStage(){
    if(TradesToday >= DailyMinTrades) return 0;
    // bar-drought based escalation
    if(BarsSinceLastEntry() >= 64) return 2;
-   MqlDateTime dt; TimeCurrent(dt);
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
    if(dt.hour >= LoosenHour2) return 2;
    if(dt.hour >= LoosenHour1) return 1;
    return 0;
@@ -691,7 +691,7 @@ bool EnforceDailyTradeQuota(){
    if(Quota_Disable_After_Losses>0 && quotaLossCount >= Quota_Disable_After_Losses) return false;
    if(!QuotaEnvironmentOK()) return false;
 
-   MqlDateTime dt; TimeCurrent(dt);
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
    if(dt.hour < Quota_Trigger_Hour || dt.hour > Quota_Final_Hour) return false;
    if(HasOpenPosition()) return false;
 
@@ -1347,8 +1347,13 @@ bool PlacePendingOrMarket(bool isLong, double lots, double pendPrice, double sl,
    rq.type = (isLong? ORDER_TYPE_BUY_STOP: ORDER_TYPE_SELL_STOP);
    rq.symbol=_Symbol; rq.volume=lots; rq.price=pendPrice; rq.sl=sl; rq.tp=tp; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK;
    if(SafeOrderSend(rq,rs)) return true;
-   CTrade t; t.SetExpertMagicNumber(Magic); t.SetDeviationInPoints(50);
-   bool ok = (isLong? t.Buy(lots, NULL, 0.0, sl, tp, tag) : t.Sell(lots, NULL, 0.0, sl, tp, tag));
+   // fallback once: market order (avoid ternary on member calls in MQL5)
+   CTrade tr;
+   tr.SetExpertMagicNumber(Magic);
+   tr.SetDeviationInPoints(50);
+   bool ok=false;
+   if(isLong) ok = tr.Buy(lots, NULL, 0.0, sl, tp, tag);
+   else       ok = tr.Sell(lots, NULL, 0.0, sl, tp, tag);
    return ok;
 }
 
@@ -1357,7 +1362,7 @@ bool ProbeAllowed()
    if(!Enable_MinLot_Probe) return false;
    if(TradesToday >= DailyMinTrades) return false;
    if(HasOpenPosition()) return false;
-   MqlDateTime dt; TimeCurrent(dt);
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
    if(dt.hour < Probe_Fire_Hour) return false;
    return true;
 }
