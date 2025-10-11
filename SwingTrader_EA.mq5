@@ -52,6 +52,18 @@ input int      Max_Bars_In_Trade = 120;    // close if trade exceeds this many M
 input bool     Use_Vol_Compress_Exit = true; // exit if volatility collapses
 input double   Vol_Compress_Ratio = 0.65;  // ATR(now)/ATR(entry) below => exit if not reached 0.5R
 
+input group "=== Risk Caps & Probes ==="
+input bool   Enable_RiskCaps          = true;    // enable budget caps
+input double Risk_Percent_Base        = 0.35;    // base % risk per trade (0.35%)
+input double DailyLossCap_R           = 1.8;     // stop trading for the day if net closed loss <= -1.8R
+input double WeeklyLossCap_R          = 4.0;     // stop trading for the week if net closed loss <= -4R
+input bool   Allow_Probe_When_Capped  = true;    // still allow micro lot probe trades under caps
+input int    Probe_Max_Per_Day        = 2;       // max probe trades/day
+input double Probe_ATR_mult           = 1.0;     // SL for probes
+input double Probe_TP_R               = 1.0;     // TP for probes
+input double Risk_Throttle_DD_Pct     = 20.0;    // when equity drawdown from peak exceeds this %, throttle risk
+input double Risk_Throttle_Pct        = 0.15;    // throttled risk % while in deep DD
+
 input group "=== Trade Hygiene ==="
 input int      MaxSpreadPoints = 200;      // reject entries if spread too wide
 input ulong    Magic           = 20251011; // EA magic
@@ -255,6 +267,19 @@ ulong    quotaPendingTicket = 0;
 bool     quotaTradeActive = false;
 datetime lastEntryBarTime = 0;
 
+// --- Risk cap accounting (R-units) ---
+double R_today = 0.0;         // closed PnL in R for current day
+double R_week  = 0.0;         // closed PnL in R for current week
+int    day_id  = -1;          // yyyyMMdd of last update
+int    week_id = -1;          // ISO week of year
+int    probe_trades_today = 0;
+double peak_equity = 0.0;
+double activeTradeRiskCash = 0.0;        // total monetary risk recorded at entry
+double activeTradeOneRCashPerLot = 0.0;  // 1R cash value per lot at entry
+double activeTradeInitialLots = 0.0;     // original position size (lots)
+double activeTradeRemainingLots = 0.0;   // lots still open for current trade
+ulong  activeTradePositionId = 0;        // position identifier to map closes
+
 // --- diagnostics counters ---
 ulong barsProcessed=0;
 ulong rej_spread=0, rej_positionOpen=0, rej_session=0, rej_atrQuiet=0;
@@ -302,6 +327,13 @@ bool SafeOrderSend(MqlTradeRequest &rq, MqlTradeResult &rs);
 bool PlacePendingOrMarket(bool isLong, double lots, double pendPrice, double sl, double tp, const string tag);
 bool ProbeAllowed();
 bool TryProbeEntry();
+void DayWeekIds(datetime t, int &d_out, int &w_out);
+void ResetRiskWindowsIfNeeded();
+double CurrentRiskPercent();
+void RecordClosedTradeR(const ulong deal_id);
+bool CapsAllowTrading(bool &probe_mode_out);
+void BumpProbeCounter(bool probe_mode);
+bool TryEnter_WithProbe(bool probe_mode);
 
 void DiagnosticsPrintSummary(){
    if(!Enable_Diagnostics) return;
@@ -427,7 +459,7 @@ bool ComputeRecentWinrate(int lookback, double &wr_out)
    datetime to=TimeCurrent(), from=to-86400*120; // 120d window
    if(!HistorySelect(from,to)) return false;
    int wins=0, total=0;
-   uint deals=HistoryDealsTotal();
+   int deals=(int)HistoryDealsTotal();
    for(int i=deals-1; i>=0 && total<lookback; --i){
       ulong ticket=HistoryDealGetTicket(i);
       if(!HistoryDealSelect(ticket)) continue;
@@ -545,7 +577,7 @@ double NormalizePrice(double p){
 
 void ResetDailyCounters(){
    MqlDateTime dt;
-   TimeCurrent(dt);
+   TimeToStruct(TimeCurrent(), dt);
    int d = dt.day;
    if(LastTradeDate != d){
       TradesToday = 0;
@@ -646,7 +678,7 @@ int LoosenStage(){
    if(TradesToday >= DailyMinTrades) return 0;
    // bar-drought based escalation
    if(BarsSinceLastEntry() >= 64) return 2;
-   MqlDateTime dt; TimeCurrent(dt);
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
    if(dt.hour >= LoosenHour2) return 2;
    if(dt.hour >= LoosenHour1) return 1;
    return 0;
@@ -659,7 +691,7 @@ bool EnforceDailyTradeQuota(){
    if(Quota_Disable_After_Losses>0 && quotaLossCount >= Quota_Disable_After_Losses) return false;
    if(!QuotaEnvironmentOK()) return false;
 
-   MqlDateTime dt; TimeCurrent(dt);
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
    if(dt.hour < Quota_Trigger_Hour || dt.hour > Quota_Final_Hour) return false;
    if(HasOpenPosition()) return false;
 
@@ -797,8 +829,40 @@ void PrintStageInfo(int stage){
    double ciMax    = (stage==2? CI_Max_L2  : stage==1? CI_Max_L1  : CI_Max_L0);
    double spaceATR = (stage==2? MinSpace_ATR_L2 : stage==1? MinSpace_ATR_L1 : MinSpace_ATR_L0);
    int    rsiMid   = (stage==2? RSI_Mid_L2 : 50);
-   PrintFormat("[Stage] dayTrades=%d stage=%d adxMin=%d ciMax=%.1f spaceATR=%.2f rsiMid=%d", 
+   PrintFormat("[Stage] dayTrades=%d stage=%d adxMin=%d ciMax=%.1f spaceATR=%.2f rsiMid=%d",
                TradesToday, stage, adxMin, ciMax, spaceATR, rsiMid);
+}
+
+// Wrapper to allow probe-mode trading under caps
+bool TryEnter_WithProbe(bool probe_mode){
+   if(!probe_mode) return TryEnter();
+   // Probe: relax momentum (still trend-aligned), min lot, ATR*Probe_ATR_mult SL, TP=Probe_TP_R
+   if(HasOpenPosition()) return false;
+   MqlRates m15[3]; if(!GetRates(PERIOD_M15,3,m15)) return false;
+   double atr; if(!GetValue(hATR_M15,0,1,atr)) return false;
+   double atrPts = (atr>0.0? atr/_Point : 0.0);
+   double emaFastH1, emaSlowH1; if(!GetValue(hEMA_H1_fast,0,1,emaFastH1)||!GetValue(hEMA_H1_slow,0,1,emaSlowH1)) return false;
+   bool up = (emaFastH1>emaSlowH1), dn = (emaFastH1<emaSlowH1);
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK), bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   int stopLevel=(int)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
+   double sl_pts = MathMax(stopLevel+5, Probe_ATR_mult*(atr/_Point));
+   double lots = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   NormalizeVolume(lots);
+   trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50);
+   if(up){
+      double sl = NormalizeDouble(ask - sl_pts*_Point,(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS));
+      double tp = NormalizeDouble(ask + sl_pts*Probe_TP_R*_Point,(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS));
+      if(trade.Buy(lots,NULL,ask,sl,tp,"PROBE_LONG")){
+         partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=sl_pts; entryATRPoints=atrPts; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; probeStopPts=sl_pts; probeBarsSinceEntry=0; BumpProbeCounter(true); return true;
+      }
+   }else if(dn){
+      double sl = NormalizeDouble(bid + sl_pts*_Point,(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS));
+      double tp = NormalizeDouble(bid - sl_pts*Probe_TP_R*_Point,(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS));
+      if(trade.Sell(lots,NULL,bid,sl,tp,"PROBE_SHORT")){
+         partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=sl_pts; entryATRPoints=atrPts; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; probeStopPts=sl_pts; probeBarsSinceEntry=0; BumpProbeCounter(true); return true;
+      }
+   }
+   return false;
 }
 
 bool TryEnter(){
@@ -957,6 +1021,8 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
       double rawStopPts = PointsFromPrice(ask - finalSLPrice);
       double minStopPtsFloor = MathMax(minStopPts, MathMax(MinStop_Points, MinStop_ATR * (atrPts>0.0? atrPts : MinStop_Points)));
       double stopPts=MathMax(rawStopPts, minStopPtsFloor);
+      const double MAX_SL_PTS = 4000;
+      if(stopPts > MAX_SL_PTS) stopPts = MAX_SL_PTS;
       double stopDistPrice=PriceFromPoints(stopPts);
       double lots=LotsByRiskSafe(stopPts);
       lots = ApplyFailSafeRisk(lots, failSafeActive);
@@ -989,6 +1055,8 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
       double rawStopPts = PointsFromPrice(finalSLPrice - bid);
       double minStopPtsFloor = MathMax(minStopPts, MathMax(MinStop_Points, MinStop_ATR * (atrPts>0.0? atrPts : MinStop_Points)));
       double stopPts=MathMax(rawStopPts, minStopPtsFloor);
+      const double MAX_SL_PTS = 4000;
+      if(stopPts > MAX_SL_PTS) stopPts = MAX_SL_PTS;
       double stopDistPrice=PriceFromPoints(stopPts);
       double lots=LotsByRiskSafe(stopPts);
       lots = ApplyFailSafeRisk(lots, failSafeActive);
@@ -1191,16 +1259,34 @@ bool SafeOrderSend(MqlTradeRequest &rq, MqlTradeResult &rs)
    return OrderSend(rq, rs);
 }
 
-double LotsFromRisk(double stopPts){
-   double lots = LotsByRiskSafe(stopPts);
+double LotsFromRisk(double stop_points){
+   if(stop_points<=0) return 0.0;
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk_pct = CurrentRiskPercent();
+   double risk_money = balance * (risk_pct/100.0);
+
+   double tick_value = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+   double tick_size  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+   double stop_price = stop_points*_Point;
+   double ticks = stop_price / MathMax(1e-10, tick_size);
+   double risk_per_lot = ticks * tick_value;
+
+   double lots = (risk_per_lot>0.0 ? risk_money / risk_per_lot : 0.0);
+
    double minLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
    double maxLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
    double lotStep = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
-   if(minLot<=0 || lotStep<=0){ minLot=0.01; lotStep=0.01; }
-   lots = MathMax(minLot, MathMin(maxLot, lots));
-   lots = MathCeil(lots/lotStep)*lotStep;
-   NormalizeVolume(lots);
+
    if(lots < minLot) lots = minLot;
+   if(lots > maxLot) lots = maxLot;
+
+   if(lotStep<=0.0) lotStep = MathMax(0.01, minLot);
+
+   // step align
+   lots = MathFloor((lots+1e-12)/lotStep)*lotStep;
+   if(lots < minLot) lots = minLot;
+   if(lots > maxLot) lots = maxLot;
+   lots = NormalizeDouble(lots, (int)MathMin(8.0, MathMax(0.0, MathRound(-MathLog10(lotStep)))));
    return lots;
 }
 
@@ -1233,7 +1319,7 @@ double LotsByRiskSafe(double stopPts){
    if(moneyPerPoint<=0.0) return 0.0;
 
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double riskMoney = equity*(Risk_Percent/100.0);
+   double riskMoney = equity*(CurrentRiskPercent()/100.0);
    double lossPerLot = moneyPerPoint*stopPts;
    if(lossPerLot<=0.0) return 0.0;
 
@@ -1261,8 +1347,13 @@ bool PlacePendingOrMarket(bool isLong, double lots, double pendPrice, double sl,
    rq.type = (isLong? ORDER_TYPE_BUY_STOP: ORDER_TYPE_SELL_STOP);
    rq.symbol=_Symbol; rq.volume=lots; rq.price=pendPrice; rq.sl=sl; rq.tp=tp; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK;
    if(SafeOrderSend(rq,rs)) return true;
-   CTrade t; t.SetExpertMagicNumber(Magic); t.SetDeviationInPoints(50);
-   bool ok = (isLong? t.Buy(lots, NULL, 0.0, sl, tp, tag) : t.Sell(lots, NULL, 0.0, sl, tp, tag));
+   // fallback once: market order (avoid ternary on member calls in MQL5)
+   CTrade tr;
+   tr.SetExpertMagicNumber(Magic);
+   tr.SetDeviationInPoints(50);
+   bool ok=false;
+   if(isLong) ok = tr.Buy(lots, NULL, 0.0, sl, tp, tag);
+   else       ok = tr.Sell(lots, NULL, 0.0, sl, tp, tag);
    return ok;
 }
 
@@ -1271,7 +1362,7 @@ bool ProbeAllowed()
    if(!Enable_MinLot_Probe) return false;
    if(TradesToday >= DailyMinTrades) return false;
    if(HasOpenPosition()) return false;
-   MqlDateTime dt; TimeCurrent(dt);
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
    if(dt.hour < Probe_Fire_Hour) return false;
    return true;
 }
@@ -1301,8 +1392,111 @@ bool TryProbeEntry()
    double tp = (wantLong? NormalizePrice(ask+PriceFromPoints(useStopPts*TP2_R)) : NormalizePrice(bid-PriceFromPoints(useStopPts*TP2_R)));
    double pend = (wantLong? NormalizePrice(m15[1].high + PriceFromPoints(EntryBufferPts)) : NormalizePrice(m15[1].low - PriceFromPoints(EntryBufferPts)));
    bool ok = PlacePendingOrMarket(wantLong, lots, pend, sl, tp, (wantLong? "ProbeLong" : "ProbeShort"));
-   if(ok){ TradesToday++; return true; }
+   if(ok){ TradesToday++; BumpProbeCounter(true); return true; }
    return false;
+}
+
+void DayWeekIds(datetime t, int &d_out, int &w_out){
+   MqlDateTime dt; TimeToStruct(t, dt);
+   d_out = dt.year*10000 + dt.mon*100 + dt.day;
+   // approximate ISO week: week number = day-of-year / 7 (good enough for gating reset)
+   int doy = (int)TimeDayOfYear(t);
+   w_out = dt.year*100 + (doy/7);
+}
+
+void ResetRiskWindowsIfNeeded(){
+   int d,w; DayWeekIds(TimeCurrent(), d, w);
+   if(day_id != d){ day_id = d; R_today = 0.0; probe_trades_today = 0; }
+   if(week_id != w){ week_id = w; R_week = 0.0; }
+}
+
+double CurrentRiskPercent(){
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(peak_equity <= 0.0) peak_equity = eq;
+   if(eq > peak_equity) peak_equity = eq;
+   double dd_pct = 100.0 * (peak_equity - eq) / MathMax(1.0, peak_equity);
+   double base = Risk_Percent_Base;
+   if(dd_pct >= Risk_Throttle_DD_Pct) base = MathMin(base, Risk_Throttle_Pct);
+   return base;
+}
+
+void RecordClosedTradeR(const ulong deal_id){
+   ResetRiskWindowsIfNeeded();
+   if(!HistoryDealSelect(deal_id)) return;
+   long magic = (long)HistoryDealGetInteger(deal_id, DEAL_MAGIC);
+   if((ulong)magic != Magic) return;
+
+   long entryType = HistoryDealGetInteger(deal_id, DEAL_ENTRY);
+   if(entryType != DEAL_ENTRY_OUT) return;
+
+   // Profit in account currency
+   double profit = HistoryDealGetDouble(deal_id, DEAL_PROFIT)
+                 + HistoryDealGetDouble(deal_id, DEAL_SWAP)
+                 + HistoryDealGetDouble(deal_id, DEAL_COMMISSION);
+
+   ulong positionId = (ulong)HistoryDealGetInteger(deal_id, DEAL_POSITION_ID);
+   double riskCash = activeTradeRiskCash;
+   if(positionId != 0 && activeTradePositionId != 0 && positionId != activeTradePositionId)
+      riskCash = 0.0;
+
+   if(riskCash <= 0.0){
+      double stop_pts = entryStopPoints;
+      if(stop_pts <= 0.0) stop_pts = probeStopPts;
+      if(stop_pts <= 0.0){
+         double atrLast=0.0;
+         if(GetValue(hATR_M15,0,1,atrLast)) stop_pts = MathMax(1.0, atrLast/_Point);
+      }
+      double tick_value = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+      double tick_size  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+      double baseLots = (activeTradeInitialLots>0.0? activeTradeInitialLots : HistoryDealGetDouble(deal_id, DEAL_VOLUME));
+      double one_r_cash_per_lot = activeTradeOneRCashPerLot;
+      if(one_r_cash_per_lot <= 0.0 && stop_pts>0.0 && tick_value>0.0 && tick_size>0.0)
+         one_r_cash_per_lot = (stop_pts*_Point/MathMax(1e-10, tick_size)) * tick_value;
+      if(one_r_cash_per_lot>0.0 && baseLots>0.0)
+         riskCash = one_r_cash_per_lot * baseLots;
+   }
+
+   if(riskCash <= 0.0) return;
+
+   double r_units = (riskCash!=0.0 ? profit/riskCash : 0.0);
+
+   R_today += r_units;
+   R_week  += r_units;
+
+   if(positionId != 0 && positionId == activeTradePositionId){
+      double closedVol = HistoryDealGetDouble(deal_id, DEAL_VOLUME);
+      activeTradeRemainingLots = MathMax(0.0, activeTradeRemainingLots - closedVol);
+      if(activeTradeRemainingLots <= 0.0 || !PositionSelect(_Symbol)){
+         activeTradeRiskCash = 0.0;
+         activeTradeOneRCashPerLot = 0.0;
+         activeTradeInitialLots = 0.0;
+         activeTradeRemainingLots = 0.0;
+         activeTradePositionId = 0;
+      }
+   } else if(!PositionSelect(_Symbol)){
+      activeTradeRiskCash = 0.0;
+      activeTradeOneRCashPerLot = 0.0;
+      activeTradeInitialLots = 0.0;
+      activeTradeRemainingLots = 0.0;
+      activeTradePositionId = 0;
+   }
+}
+
+bool CapsAllowTrading(bool &probe_mode_out){
+   ResetRiskWindowsIfNeeded();
+   probe_mode_out = false;
+   if(!Enable_RiskCaps) return true;
+   bool day_ok   = (R_today > -DailyLossCap_R);
+   bool week_ok  = (R_week  > -WeeklyLossCap_R);
+   if(day_ok && week_ok) return true;
+   if(Allow_Probe_When_Capped && probe_trades_today < Probe_Max_Per_Day){
+      probe_mode_out = true; return true;
+   }
+   return false;
+}
+
+void BumpProbeCounter(bool probe_mode){
+   if(probe_mode) probe_trades_today++;
 }
 
 double ApplyFailSafeRisk(double lots, bool apply){
@@ -1681,6 +1875,8 @@ int OnInit(){
    quotaPendingTicket = 0;
    quotaTradeActive = false;
    lastEntryBarTime = 0;
+   ResetRiskWindowsIfNeeded();
+   peak_equity = AccountInfoDouble(ACCOUNT_EQUITY);
    return(INIT_SUCCEEDED);
 }
 
@@ -1707,9 +1903,48 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
    if((ulong)magic != Magic) return;
 
    long entryType = HistoryDealGetInteger(dealId, DEAL_ENTRY);
-   double profit = HistoryDealGetDouble(dealId, DEAL_PROFIT) + HistoryDealGetDouble(dealId, DEAL_SWAP) + HistoryDealGetDouble(dealId, DEAL_COMMISSION);
 
    if(entryType == DEAL_ENTRY_IN){
+      double volume = HistoryDealGetDouble(dealId, DEAL_VOLUME);
+      double stopPts = entryStopPoints;
+      if(stopPts <= 0.0) stopPts = probeStopPts;
+      if(stopPts <= 0.0){
+         double atrLast=0.0;
+         if(GetValue(hATR_M15,0,1,atrLast)) stopPts = MathMax(1.0, atrLast/_Point);
+      }
+      double tick_value = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+      double tick_size  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+      double oneRCashPerLot = 0.0;
+      if(stopPts > 0.0 && tick_value>0.0 && tick_size>0.0)
+         oneRCashPerLot = (stopPts*_Point/MathMax(1e-10, tick_size)) * tick_value;
+      activeTradeOneRCashPerLot = oneRCashPerLot;
+      activeTradeInitialLots = volume;
+      activeTradeRemainingLots = volume;
+      activeTradeRiskCash = oneRCashPerLot * volume;
+      activeTradePositionId = (ulong)HistoryDealGetInteger(dealId, DEAL_POSITION_ID);
+      if(activeTradeRiskCash <= 0.0){
+         double fallbackStopPts = stopPts;
+         if(PositionSelect(_Symbol) && (ulong)PositionGetInteger(POSITION_MAGIC)==Magic){
+            double posPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            double posSL    = PositionGetDouble(POSITION_SL);
+            double posVol   = PositionGetDouble(POSITION_VOLUME);
+            if(posVol > 0.0){
+               volume = posVol;
+               activeTradeInitialLots = volume;
+               activeTradeRemainingLots = volume;
+            }
+            if(posSL > 0.0 && posPrice>0.0)
+               fallbackStopPts = MathMax(fallbackStopPts, MathAbs(posPrice-posSL)/_Point);
+         }
+         double atrFallback=0.0;
+         if(fallbackStopPts <= 0.0 && GetValue(hATR_M15,0,1,atrFallback))
+            fallbackStopPts = MathMax(1.0, atrFallback/_Point);
+         if(fallbackStopPts>0.0 && tick_value>0.0 && tick_size>0.0){
+            double fallbackOneR = (fallbackStopPts*_Point/MathMax(1e-10, tick_size)) * tick_value;
+            activeTradeOneRCashPerLot = fallbackOneR;
+            activeTradeRiskCash = fallbackOneR * MathMax(volume, SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN));
+         }
+      }
       TradesToday++;
       barsSinceEntry = 0;
       lastEntryStopPts = entryStopPoints;
@@ -1721,54 +1956,55 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
       } else {
          quotaTradeActive = false;
       }
+      return;
    }
-   else if(entryType != DEAL_ENTRY_OUT) return;
-   else {
-      long dealType = HistoryDealGetInteger(dealId, DEAL_TYPE);
-      bool isBuy = (dealType==DEAL_TYPE_BUY);
-      bool win = (profit > 0.0);
-      UpdateSidePerformance(isBuy, win);
 
-      double outcome = (profit>0.0 ? 1.0 : (profit<0.0 ? -1.0 : 0.0));
-      recentWinsLosses[rwlIndex] = outcome;
-      rwlIndex = (rwlIndex+1) % 32;
-      rwlCount = (int)MathMin(rwlCount+1,32);
-      if(profit < 0.0){
-         dayLossCount++;
-         if(quotaTradeActive) quotaLossCount++;
-      } else if(profit > 0.0){
-         dayLossCount = 0;
-      }
-      quotaTradeActive = false;
-      barsSinceEntry = 0;
-      lastEntryStopPts = 0.0;
-      probeBarsSinceEntry = 0;
-      probeStopPts = 0.0;
+   if(entryType != DEAL_ENTRY_OUT) return;
 
-      if(!LossStreak_Protection) return;
+   RecordClosedTradeR(dealId);
 
-      if(profit < 0){
-         consecutiveLosses++;
-         if(consecutiveLosses >= Max_Loss_Streak){
-            cooldownBarsRemaining = Loss_Cooldown_Bars;
-            if(Enable_Diagnostics) Print("[Diag] Loss streak triggered cooldown bars=",cooldownBarsRemaining);
-            consecutiveLosses = 0; // reset after triggering
-         }
-      } else if(profit > 0){
-         consecutiveLosses = 0; // reset on win
-      }
+   double profit = HistoryDealGetDouble(dealId, DEAL_PROFIT) + HistoryDealGetDouble(dealId, DEAL_SWAP) + HistoryDealGetDouble(dealId, DEAL_COMMISSION);
+   long dealType = HistoryDealGetInteger(dealId, DEAL_TYPE);
+   bool isBuy = (dealType==DEAL_TYPE_BUY);
+   bool win = (profit > 0.0);
+   UpdateSidePerformance(isBuy, win);
+
+   double outcome = (profit>0.0 ? 1.0 : (profit<0.0 ? -1.0 : 0.0));
+   recentWinsLosses[rwlIndex] = outcome;
+   rwlIndex = (rwlIndex+1) % 32;
+   rwlCount = (int)MathMin(rwlCount+1,32);
+   if(profit < 0.0){
+      dayLossCount++;
+      if(quotaTradeActive) quotaLossCount++;
+   } else if(profit > 0.0){
+      dayLossCount = 0;
    }
-   if(trans.type==TRADE_TRANSACTION_DEAL_ADD){
-      if(!HistoryDealSelect(trans.deal)) return;
-      long e=(long)HistoryDealGetInteger(trans.deal,DEAL_ENTRY);
-      if(e==DEAL_ENTRY_IN){
-         lastEntryBarTime = iTime(_Symbol,PERIOD_M15,0);
+   quotaTradeActive = false;
+   barsSinceEntry = 0;
+   lastEntryStopPts = 0.0;
+   probeBarsSinceEntry = 0;
+   probeStopPts = 0.0;
+
+   if(!LossStreak_Protection) return;
+
+   if(profit < 0){
+      consecutiveLosses++;
+      if(consecutiveLosses >= Max_Loss_Streak){
+         cooldownBarsRemaining = Loss_Cooldown_Bars;
+         if(Enable_Diagnostics) Print("[Diag] Loss streak triggered cooldown bars=",cooldownBarsRemaining);
+         consecutiveLosses = 0; // reset after triggering
       }
+   } else if(profit > 0){
+      consecutiveLosses = 0; // reset on win
    }
 }
 
 void OnTick(){
    ResetDailyCounters();
+   ResetRiskWindowsIfNeeded();
+   double eqNow = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(peak_equity <= 0.0) peak_equity = eqNow;
+   if(eqNow > peak_equity) peak_equity = eqNow;
    // manage open trade each tick
    ManagePartialAndTrail();
 
@@ -1784,9 +2020,22 @@ void OnTick(){
    barsProcessed++; bool verboseBar = (Enable_Diagnostics && Verbose_First_N && (barsProcessed <= (ulong)Verbose_Bars_Limit));
    if(Diagnostics) PrintStageInfo(LoosenStage());
 
+   bool probeMode=false;
+   if(!CapsAllowTrading(probeMode)){
+      if(Enable_Diagnostics) Print("[Gate] Risk cap active: R_today=",DoubleToString(R_today,2)," R_week=",DoubleToString(R_week,2));
+      if(Enable_Diagnostics && Diagnostics_Every_Bars>0 && (barsProcessed % (ulong)Diagnostics_Every_Bars)==0) DiagnosticsPrintSummary();
+      return;
+   }
+
+   if(probeMode){
+      TryEnter_WithProbe(true);
+      if(Enable_Diagnostics && Diagnostics_Every_Bars>0 && (barsProcessed % (ulong)Diagnostics_Every_Bars)==0) DiagnosticsPrintSummary();
+      return;
+   }
+
    // New entry flow (lenient/quality presets)
    if(Use_New_Entry_Flow){
-      TryEnter();
+      TryEnter_WithProbe(false);
       // still run diagnostics summary cadence
       if(Enable_Diagnostics && Diagnostics_Every_Bars>0 && (barsProcessed % (ulong)Diagnostics_Every_Bars)==0) DiagnosticsPrintSummary();
       return; // skip legacy pipeline
@@ -1915,7 +2164,22 @@ void OnTick(){
                   return true;
                }
             }
-            else { trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50); if(trade.Buy(lots,NULL,ask,sl,tp,"M15SwingLong")){ partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atr_points; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; } }
+            else {
+               trade.SetExpertMagicNumber(Magic);
+               trade.SetDeviationInPoints(50);
+               if(trade.Buy(lots,NULL,ask,sl,tp,"M15SwingLong")){
+                  partialTaken=false;
+                  secondPartialTaken=false;
+                  entryTime=TimeCurrent();
+                  entryStopPoints=stopPts;
+                  entryATRPoints=atr_points;
+                  signalHigh=m15[1].high;
+                  signalLow=m15[1].low;
+                  structureBreakOccurred=false;
+                  beMoved=false;
+                  return true;
+               }
+            }
          }
       }
    } else {
@@ -1972,7 +2236,22 @@ void OnTick(){
                   return true;
                }
             }
-            else { trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50); if(trade.Sell(lots,NULL,bid,sl,tp,"M15SwingShort")){ partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atr_points; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; } }
+            else {
+               trade.SetExpertMagicNumber(Magic);
+               trade.SetDeviationInPoints(50);
+               if(trade.Sell(lots,NULL,bid,sl,tp,"M15SwingShort")){
+                  partialTaken=false;
+                  secondPartialTaken=false;
+                  entryTime=TimeCurrent();
+                  entryStopPoints=stopPts;
+                  entryATRPoints=atr_points;
+                  signalHigh=m15[1].high;
+                  signalLow=m15[1].low;
+                  structureBreakOccurred=false;
+                  beMoved=false;
+                  return true;
+               }
+            }
          }
       }
    } else {
