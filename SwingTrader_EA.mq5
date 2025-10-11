@@ -2161,7 +2161,7 @@ void OnTick(){
                   entryTime=TimeCurrent();
                   probeStopPts=0.0;
                   probeBarsSinceEntry=0;
-                  return true;
+                  return;
                }
             }
             else {
@@ -2177,7 +2177,7 @@ void OnTick(){
                   signalLow=m15[1].low;
                   structureBreakOccurred=false;
                   beMoved=false;
-                  return true;
+                  return;
                }
             }
          }
@@ -2233,7 +2233,7 @@ void OnTick(){
                   entryTime=TimeCurrent();
                   probeStopPts=0.0;
                   probeBarsSinceEntry=0;
-                  return true;
+                  return;
                }
             }
             else {
@@ -2249,7 +2249,7 @@ void OnTick(){
                   signalLow=m15[1].low;
                   structureBreakOccurred=false;
                   beMoved=false;
-                  return true;
+                  return;
                }
             }
          }
@@ -2260,7 +2260,7 @@ void OnTick(){
       if(verboseBar) Print("[Diag] Short reject tDn=",trendDown," below=",belowStruct," pull=",touchedPullShort," mom=",momentumShortOK," bear=",bearCandle," ext=",DoubleToString(extensionATR,2));
    }
 
-   if(TryProbeEntry()) return true;
+   if(TryProbeEntry()) return;
 
    // pending order expiry (evaluate once per bar)
    if(pendingTicket>0){
