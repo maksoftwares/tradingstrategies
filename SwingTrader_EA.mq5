@@ -23,10 +23,13 @@ input int      MACD_Signal     = 9;
 
 input group "=== Risk & Money Management ==="
 input double   Risk_Percent    = 1.00;     // % of balance per trade
+input double   MaxRiskLotsCap  = 0.10;     // hard cap per trade
+input double   MinStop_ATR     = 1.0;      // ensure SL distance >= 1×ATR
+input double   MinStop_Points  = 50.0;     // absolute floor in points
 input int      ATR_Period      = 14;
 input double   ATR_SL_mult     = 2.5;      // SL = max(ATR*mult, swing buffer)
 input double   Swing_Buffer_ATR= 0.20;     // extra beyond fractal (as ATR multiple)
-input double   TP1_R           = 1.2;      // first partial (tighter for faster risk reduction)
+input double   TP1_R           = 1.05;     // first partial (tighter for faster risk reduction)
 input double   TP2_R           = 2.0;      // second partial / scale-out point
 input double   TP3_R           = 3.5;      // runner target
 input bool     Use_TP3         = true;     // enable third target
@@ -48,7 +51,7 @@ input bool     Use_Vol_Compress_Exit = true; // exit if volatility collapses
 input double   Vol_Compress_Ratio = 0.65;  // ATR(now)/ATR(entry) below => exit if not reached 0.5R
 
 input group "=== Trade Hygiene ==="
-input int      MaxSpreadPoints = 300;      // reject entries if spread too wide
+input int      MaxSpreadPoints = 200;      // reject entries if spread too wide
 input ulong    Magic           = 20251011; // EA magic
 
 input group "=== Advanced Filters & Sessions ==="
@@ -91,7 +94,7 @@ input int      SR_Lookback            = 20;     // swing high/low lookback for n
 
 input group "=== Confirmation Entry (Stop Orders) ==="
 input bool     Use_Stop_Confirmation  = true;   // Use pending stop orders for confirmation
-input int      EntryBufferPts         = 20;     // buffer (points) beyond signal candle extreme
+input int      EntryBufferPts         = 15;     // buffer (points) beyond signal candle extreme
 input int      PendingOrder_Expiry_Bars = 4;    // cancel pending after N bars
 input bool     UseStopOrders          = false;  // New flow toggle (market vs stop)
 input double   EntryBufferPts_New     = 15;     // New flow entry buffer
@@ -105,7 +108,7 @@ input group "=== Dynamic Spread & Sessions ==="
 input bool     Dynamic_Spread_Cap     = true;   // dynamic spread cap using ATR
 input double   Spread_ATR_Fraction    = 0.30;   // allowed spread = % of ATR (points) - LENIENT
 input int      HardSpreadCapPts       = 600;    // absolute safety ceiling
-input bool     Stage2_IgnoresSpread   = true;   // bypass spread check at stage 2 when no trades yet
+input bool     Stage2_IgnoresSpread   = false;  // bypass spread check at stage 2 when no trades yet
 input bool     Enhanced_Session_Filter= false;  // refined session rules (DISABLED for 24h trading)
 input int      LondonNY_Start_Hour    = 0;      // Session start (0=all day)
 input int      LondonNY_End_Hour      = 24;     // Session end (24=all day)
@@ -126,7 +129,7 @@ input bool     AllowShorts            = true;   // enable/disable short side
 input bool     Use_New_Entry_Flow     = true;   // Activate simplified lenient/quality TryEnter() flow
 input int      CI_Max                 = 60;     // Placeholder compression index max (not yet implemented)
 input int      MaxSpreadPoints_New    = 160;    // New flow max spread hard cap
-input double   MaxSpread_ATR_Frac     = 0.20;   // New flow dynamic spread fraction
+input double   MaxSpread_ATR_Frac     = 0.30;   // New flow dynamic spread fraction
 
 input group "=== Adaptive Frequency Layer ==="
 input bool   AdaptiveLoosen     = true;  // enable dynamic threshold loosening intraday
@@ -494,10 +497,13 @@ bool TryEnter(){
       double structSLPrice=(swingL>0? swingL - Swing_Buffer_ATR*atr : ask - PriceFromPoints(atrStopPts));
       double defaultSLPrice=ask-PriceFromPoints(atrStopPts);
       double finalSLPrice=(swingL>0? MathMin(structSLPrice,defaultSLPrice):defaultSLPrice);
-      double stopPts=MathMax(minStopPts, PointsFromPrice(ask-finalSLPrice));
-      double lots=LotsFromRisk(stopPts);
+      double rawStopPrice = ask - finalSLPrice;
+      double minStopPrice = MathMax(PriceFromPoints(minStopPts), MathMax(atr * MinStop_ATR, MinStop_Points * _Point));
+      double stopDistPrice = MathMax(rawStopPrice, minStopPrice);
+      double stopPts=PointsFromPrice(stopDistPrice);
+      double lots=LotsByRiskSafe(stopDistPrice);
       if(lots<=0){ AppendReason(why,"noLots"); return LogAndReturnFalse(why); }
-      double sl=NormalizePrice(ask-PriceFromPoints(stopPts));
+      double sl=NormalizePrice(ask-stopDistPrice);
       double tpR=TP2_R;
       double tp=NormalizePrice(ask+PriceFromPoints(stopPts*tpR));
       if(UseStopOrders){
@@ -521,10 +527,13 @@ bool TryEnter(){
       double structSLPrice=(swingH>0? swingH + Swing_Buffer_ATR*atr : bid + PriceFromPoints(atrStopPts));
       double defaultSLPrice=bid+PriceFromPoints(atrStopPts);
       double finalSLPrice=(swingH>0? MathMax(structSLPrice,defaultSLPrice):defaultSLPrice);
-      double stopPts=MathMax(minStopPts, PointsFromPrice(finalSLPrice - bid));
-      double lots=LotsFromRisk(stopPts);
+      double rawStopPrice = finalSLPrice - bid;
+      double minStopPrice = MathMax(PriceFromPoints(minStopPts), MathMax(atr * MinStop_ATR, MinStop_Points * _Point));
+      double stopDistPrice = MathMax(rawStopPrice, minStopPrice);
+      double stopPts=PointsFromPrice(stopDistPrice);
+      double lots=LotsByRiskSafe(stopDistPrice);
       if(lots<=0){ AppendReason(why,"noLots"); return LogAndReturnFalse(why); }
-      double sl=NormalizePrice(bid+PriceFromPoints(stopPts));
+      double sl=NormalizePrice(bid+stopDistPrice);
       double tpR=TP2_R; double tp=NormalizePrice(bid-PriceFromPoints(stopPts*tpR));
       if(UseStopOrders){
          double pendingPrice=NormalizePrice(m15[1].low - PriceFromPoints(EntryBufferPts_New));
@@ -593,9 +602,12 @@ bool TryEnter(){
       if(altBuy || altSell){
          int stopLevel2=(int)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
          double atrPts = atr/_Point;
-         double useStopPts = MathMax((double)stopLevel2+5.0, ATR_SL_mult * atrPts);
-         double ask2=ask, bid2=bid; double slLong=NormalizePrice(ask2-PriceFromPoints(useStopPts)); double slShort=NormalizePrice(bid2+PriceFromPoints(useStopPts));
-         double lotsAlt = LotsFromRisk(useStopPts);
+         double rawStopPts = MathMax((double)stopLevel2+5.0, ATR_SL_mult * atrPts);
+         double rawStopPrice = PriceFromPoints(rawStopPts);
+         double minStopPrice = MathMax(PriceFromPoints((double)stopLevel2+5.0), MathMax(atr * MinStop_ATR, MinStop_Points * _Point));
+         double stopDistPrice = MathMax(rawStopPrice, minStopPrice);
+         double ask2=ask, bid2=bid; double slLong=NormalizePrice(ask2-stopDistPrice); double slShort=NormalizePrice(bid2+stopDistPrice);
+         double lotsAlt = LotsByRiskSafe(stopDistPrice);
          if(lotsAlt>0){
             if(Alt_UseStopOrders){
                double hi1=m15[1].high, lo1=m15[1].low; double buf=PriceFromPoints(Alt_EntryBufferPts);
@@ -627,35 +639,51 @@ bool LogAndReturnFalse(const string why){
    return false;
 }
 
-// Compute lot size from % risk and stop (in POINTS)
-double LotsFromRisk(double stop_points){
-   if(stop_points<=0) return 0.0;
-   double balance=AccountInfoDouble(ACCOUNT_BALANCE);
-   double risk_money = balance * (Risk_Percent/100.0);
+// Compute lot size from % risk and stop distance (in price units)
+double LotsByRiskSafe(double stopDistPrice){
+   if(stopDistPrice<=0.0) return 0.0;
 
-   double tick_value = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
-   double tick_size  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+   double atr=0.0;
+   if(!GetValue(hATR_M15,0,1,atr)) atr=0.0;
 
-   // stop in price units:
-   double stop_price = PriceFromPoints(stop_points);
-   // number of ticks at stop:
-   double ticks = stop_price / tick_size;
-   double risk_per_lot = ticks * tick_value;
+   double minByATR = (atr>0.0 ? atr * MinStop_ATR : 0.0);
+   double minByPts = MinStop_Points * _Point;
+   double sd = MathMax(stopDistPrice, MathMax(minByATR, minByPts));
 
-   if(risk_per_lot<=0) return 0.0;
-   double lots = risk_money / risk_per_lot;
+   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double profit=0.0;
+   double pp=0.0;
+   if(OrderCalcProfit(ORDER_TYPE_SELL,_Symbol,1.0,bid,bid-_Point,profit))
+      pp = MathAbs(profit);
 
-   double minLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
-   double maxLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
-   double lotStep = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   if(pp<=0.0){
+      double tv = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+      double ts = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+      if(ts>0.0)
+         pp = (tv/ts) * _Point;
+   }
 
-   // clamp & step
-   if(lots<minLot) lots=minLot;
-   if(lots>maxLot) lots=maxLot;
-   // step rounding
-   lots = MathFloor(lots/lotStep)*lotStep;
-   lots = NormalizeDouble(lots,2);
-   return lots;
+   if(pp<=0.0) return 0.0;
+
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = eq * (Risk_Percent/100.0);
+   double lossPerLot = pp * (sd/_Point);
+   if(lossPerLot<=0.0) return 0.0;
+
+   double lots = riskMoney / lossPerLot;
+
+   double minLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+   double step  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+
+   lots = MathMax(minLot, MathMin(MathMin(maxLot, MaxRiskLotsCap), lots));
+
+   if(step>0.0)
+      lots = MathFloor(lots/step) * step;
+
+   lots = MathMax(minLot, MathMin(MathMin(maxLot, MaxRiskLotsCap), lots));
+
+   return NormalizeDouble(lots,2);
 }
 
 bool NewM15Bar(){
@@ -1068,12 +1096,15 @@ void OnTick(){
          double swingSLprice=0.0; if(lastSwingLow>0){ double buffer=Swing_Buffer_ATR*atr_1; swingSLprice=lastSwingLow-buffer; }
          double defaultSLprice = ask - PriceFromPoints(baseSLpts);
          double chosenSLprice = (swingSLprice>0? MathMin(defaultSLprice,swingSLprice): defaultSLprice);
-         double stopPts = MathMax(minStopDistPts, PointsFromPrice(ask - chosenSLprice));
-         double lots = LotsFromRisk(stopPts);
+         double rawStopPrice = ask - chosenSLprice;
+         double minStopPrice = MathMax(PriceFromPoints(minStopDistPts), MathMax(atr_1 * MinStop_ATR, MinStop_Points * _Point));
+         double stopDistPrice = MathMax(rawStopPrice, minStopPrice);
+         double stopPts = PointsFromPrice(stopDistPrice);
+         double lots = LotsByRiskSafe(stopDistPrice);
          if(lots>0){
             entryTP2_R=TP2_R; entryTP3_R=TP3_R; if(Adaptive_R_Targets){ double atrArr[]; ArraySetAsSeries(atrArr,true); int need=MathMax(ATR_Regime_Period,10); if(CopyBuffer(hATR_M15,0,1,need,atrArr)==need){ double sum=0; for(int i=0;i<need;i++) sum+=atrArr[i]; double sma=sum/need; double ratio=(sma>0? atr_1/sma:1.0); if(ratio>HighVolRatio){ entryTP2_R+=HighVol_Target_Boost; entryTP3_R+=HighVol_Target_Boost;} else if(ratio<LowVolRatio){ entryTP2_R-=LowVol_Target_Reduction; entryTP3_R-=LowVol_Target_Reduction;} } if(entryTP2_R < TP1_R+0.1) entryTP2_R=TP1_R+0.1; if(entryTP3_R < entryTP2_R+0.2) entryTP3_R=entryTP2_R+0.2; }
             double finalR = (Use_TP3? entryTP3_R: entryTP2_R);
-            double sl = NormalizePrice(ask - PriceFromPoints(stopPts));
+            double sl = NormalizePrice(ask - stopDistPrice);
             double tp = NormalizePrice(ask + PriceFromPoints(stopPts * finalR));
             if(Use_Stop_Confirmation){ double pendingPrice=NormalizePrice(m15[1].high + PriceFromPoints(EntryBufferPts)); MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs); rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_BUY_STOP; rq.symbol=_Symbol; rq.volume=lots; rq.price=pendingPrice; rq.sl=sl; rq.tp=tp; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK; if(OrderSend(rq,rs)){ pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=1; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; if(verboseBar) Print("[Diag] Placed BuyStop #",pendingTicket," @",pendingPrice); } }
             else { trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50); if(trade.Buy(lots,NULL,ask,sl,tp,"M15SwingLong")){ partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atr_points; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; } }
@@ -1098,12 +1129,15 @@ void OnTick(){
          double swingSLprice=0.0; if(lastSwingHigh>0){ double buffer=Swing_Buffer_ATR*atr_1; swingSLprice=lastSwingHigh+buffer; }
          double defaultSLprice = bid + PriceFromPoints(baseSLpts);
          double chosenSLprice = (swingSLprice>0? MathMax(defaultSLprice,swingSLprice): defaultSLprice);
-         double stopPts = MathMax(minStopDistPts, PointsFromPrice(chosenSLprice - bid));
-         double lots = LotsFromRisk(stopPts);
+         double rawStopPrice = chosenSLprice - bid;
+         double minStopPrice = MathMax(PriceFromPoints(minStopDistPts), MathMax(atr_1 * MinStop_ATR, MinStop_Points * _Point));
+         double stopDistPrice = MathMax(rawStopPrice, minStopPrice);
+         double stopPts = PointsFromPrice(stopDistPrice);
+         double lots = LotsByRiskSafe(stopDistPrice);
          if(lots>0){
             entryTP2_R=TP2_R; entryTP3_R=TP3_R; if(Adaptive_R_Targets){ double atrArr[]; ArraySetAsSeries(atrArr,true); int need=MathMax(ATR_Regime_Period,10); if(CopyBuffer(hATR_M15,0,1,need,atrArr)==need){ double sum=0; for(int i=0;i<need;i++) sum+=atrArr[i]; double sma=sum/need; double ratio=(sma>0? atr_1/sma:1.0); if(ratio>HighVolRatio){ entryTP2_R+=HighVol_Target_Boost; entryTP3_R+=HighVol_Target_Boost;} else if(ratio<LowVolRatio){ entryTP2_R-=LowVol_Target_Reduction; entryTP3_R-=LowVol_Target_Reduction;} } if(entryTP2_R < TP1_R+0.1) entryTP2_R=TP1_R+0.1; if(entryTP3_R < entryTP2_R+0.2) entryTP3_R=entryTP2_R+0.2; }
             double finalR = (Use_TP3? entryTP3_R: entryTP2_R);
-            double sl = NormalizePrice(bid + PriceFromPoints(stopPts));
+            double sl = NormalizePrice(bid + stopDistPrice);
             double tp = NormalizePrice(bid - PriceFromPoints(stopPts * finalR));
             if(Use_Stop_Confirmation){ double pendingPrice=NormalizePrice(m15[1].low - PriceFromPoints(EntryBufferPts)); MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs); rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_SELL_STOP; rq.symbol=_Symbol; rq.volume=lots; rq.price=pendingPrice; rq.sl=sl; rq.tp=tp; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK; if(OrderSend(rq,rs)){ pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=0; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; if(verboseBar) Print("[Diag] Placed SellStop #",pendingTicket," @",pendingPrice); } }
             else { trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50); if(trade.Sell(lots,NULL,bid,sl,tp,"M15SwingShort")){ partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atr_points; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; } }
