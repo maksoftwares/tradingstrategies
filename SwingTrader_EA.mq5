@@ -59,8 +59,8 @@ input bool     RequireBothMomentum    = true;   // MACD AND RSI must confirm
 input double   Min_ATR_Filter         = 5.0;    // Minimum ATR (points) to allow trades
 input double   Max_Close_Extension_ATR= 1.2;    // Reject if close is > this * ATR above/below pullback EMA
 input bool     Use_Session_Filter     = false;  // Restrict trading to session hours
-input int      Session_Start_Hour     = 0;      // Session start (server time)
-input int      Session_End_Hour       = 24;     // Session end
+input int      Session_Start_Hour     = 6;      // Session start (server time)
+input int      Session_End_Hour       = 20;     // Session end
 input bool     DelayTrailUntilPartial = true;   // Do not trail until partial profit
 input double   Trail_Start_R          = 2.0;    // Start trailing only after this R reached if partial not yet
 input group "=== Diagnostics ==="
@@ -99,12 +99,6 @@ input int      PendingOrder_Expiry_Bars = 4;    // cancel pending after N bars
 input bool     UseStopOrders          = false;  // New flow toggle (market vs stop)
 input double   EntryBufferPts_New     = 15;     // New flow entry buffer
 
-input group "=== Scored Entry Settings ==="
-input bool     Score_UseMarketForAlt  = true;   // scored path uses market by default
-input int      Score_T0               = 80;
-input int      Score_T1               = 68;
-input int      Score_T2               = 58;
-
 input group "=== Break-Even Logic ==="
 input bool     MoveBE_On_StructureBreak = true; // Move to BE only after structure break
 input double   BE_Fallback_R          = 1.2;    // fallback R to force BE if no break
@@ -128,11 +122,11 @@ input group "=== Loss Streak & Side Control ==="
 input bool     LossStreak_Protection  = true;   // pause after loss streak
 input int      Max_Loss_Streak        = 3;
 input int      Loss_Cooldown_Bars     = 2;      // reduced to 2 for maximum opportunity frequency
-input int      MinBarsForSignals      = 50;     // minimum bars required before allowing signals
+input int      MinBarsForSignals      = 300;    // minimum bars required before allowing signals
 // (Adjusted later: default will be reduced to 3 in adaptive frequency changes)
 input bool     AllowLongs             = true;   // enable/disable long side
 input bool     AllowShorts            = true;   // enable/disable short side
-input bool     Use_New_Entry_Flow     = true;   // Activate simplified lenient/quality TryEnter() flow // set to false to compare with legacy path
+input bool     Use_New_Entry_Flow     = true;   // Activate simplified lenient/quality TryEnter() flow
 input int      CI_Max                 = 60;     // Placeholder compression index max (not yet implemented)
 input int      MaxSpreadPoints_New    = 160;    // New flow max spread hard cap
 input double   MaxSpread_ATR_Frac     = 0.30;   // New flow dynamic spread fraction
@@ -142,7 +136,6 @@ input bool   AdaptiveLoosen     = true;  // enable dynamic threshold loosening i
 input int    DailyMinTrades     = 1;     // target minimum trades per day
 input int    LoosenHour1        = 12;    // first relax hour (server time)
 input int    LoosenHour2        = 16;    // second relax hour
-input bool   Disable_CI_Filter     = true;   // NEW: bypass CI gate by default
 input int    ADX_Min_L0         = 20;    // base strict
 input int    ADX_Min_L1         = 18;    // first relax
 input int    ADX_Min_L2         = 14;    // second relax
@@ -161,14 +154,6 @@ input double Stage2_MinSpace_ATR    = 0.10;  // minimal space requirement at sta
 input bool   Stage2_IgnoreSlope     = true;  // bypass slope check at stage 2
 input bool   Stage2_IgnoreStructure = true;  // bypass structure space at stage 2
 input bool   Stage2_OptionalADX     = true;  // make ADX optional at stage 2
-
-input group "=== Daily Bracket Fail-Safe ==="
-input bool     DailyBracketON      = true;
-input int      ForceHour           = 17;      // server hour to arm bracket
-input int      DC_Period           = 20;
-input int      DC_BufferPts        = 12;
-input double   FailSafe_RiskMult   = 0.25;    // fraction of normal risk for bracket
-input bool     Bracket_UseStops    = true;
 
 //--- handles
 int hEMA_H1_fast, hEMA_H1_slow, hEMA_M15_pull, hEMA_M15_struct;
@@ -208,7 +193,6 @@ int consecutiveLosses=0;
 int cooldownBarsRemaining=0;
 int TradesToday = 0;        // daily trade counter
 int LastTradeDate = -1;     // last date (day of month) we recorded trades
-bool BracketPlacedToday = false;
 
 // forward declarations for new helpers
 int  LoosenStage();
@@ -356,7 +340,6 @@ void ResetDailyCounters(){
    if(LastTradeDate != d){
       TradesToday = 0;
       LastTradeDate = d;
-      BracketPlacedToday = false;
    }
 }
 
@@ -391,83 +374,6 @@ double ComputeCompressionIndex(int lookback){
    return ci;
 }
 
-double MACDHistogram(int shift=1){
-   double hist[];
-   if(CopyBuffer(hMACD_M15,2,shift,1,hist)>0) return hist[0];
-   double main[], signal[];
-   if(CopyBuffer(hMACD_M15,0,shift,1,main)>0 && CopyBuffer(hMACD_M15,1,shift,1,signal)>0)
-      return main[0] - signal[0];
-   return 0.0;
-}
-
-double ChoppinessIndex(int period){
-   return ComputeCompressionIndex(period);
-}
-
-double DC_High(int p){
-   double hi=-DBL_MAX;
-   for(int i=1;i<=p;i++){
-      double v=iHigh(_Symbol,PERIOD_M15,i);
-      if(v>hi) hi=v;
-   }
-   return (hi==-DBL_MAX?0.0:hi);
-}
-
-double DC_Low(int p){
-   double lo=DBL_MAX;
-   for(int i=1;i<=p;i++){
-      double v=iLow(_Symbol,PERIOD_M15,i);
-      if(v<lo) lo=v;
-   }
-   return (lo==DBL_MAX?0.0:lo);
-}
-
-int ScoreThreshold(int stage){
-   if(stage>=2) return Score_T2;
-   if(stage==1) return Score_T1;
-   return Score_T0;
-}
-
-int ScoreStageBonus(int stage){
-   if(stage<=0) return 0;
-   if(stage==1) return 7;
-   return 15;
-}
-
-int FeatureScoreLong(bool trendUp,bool momentum,bool pullback,bool structure,bool space,bool adxOk,bool ciOk,double rsi,double macdHist){
-   int score=0;
-   score += trendUp   ? 25 : -10;
-   score += momentum  ? 20 : -10;
-   score += pullback  ? 15 : 0;
-   score += structure ? 15 : 0;
-   score += space     ? 10 : 0;
-   score += adxOk     ? 10 : -5;
-   score += ciOk      ? 5  : -5;
-   if(rsi>55) score+=5;
-   else if(rsi<50) score-=5;
-   score += (macdHist>0 ? 5 : -5);
-   if(score<0) score=0;
-   if(score>100) score=100;
-   return score;
-}
-
-int FeatureScoreShort(bool trendDown,bool momentum,bool pullback,bool structure,bool space,bool adxOk,bool ciOk,double rsi,double macdHist){
-   int score=0;
-   score += trendDown ? 25 : -10;
-   score += momentum  ? 20 : -10;
-   score += pullback  ? 15 : 0;
-   score += structure ? 15 : 0;
-   score += space     ? 10 : 0;
-   score += adxOk     ? 10 : -5;
-   score += ciOk      ? 5  : -5;
-   if(rsi<45) score+=5;
-   else if(rsi>50) score-=5;
-   score += (macdHist<0 ? 5 : -5);
-   if(score<0) score=0;
-   if(score>100) score=100;
-   return score;
-}
-
 void PrintStageInfo(int stage){
    if(!Diagnostics) return;
    int    adxMin   = (stage==2? ADX_Min_L2 : stage==1? ADX_Min_L1 : ADX_Min_L0);
@@ -481,97 +387,79 @@ void PrintStageInfo(int stage){
 bool TryEnter(){
    string why="";
 
+   // --- MinBars Guard: Prevent early-begin history artifact ---
    if(Bars(_Symbol,PERIOD_M15) < MinBarsForSignals){ AppendReason(why,"minBars"); return LogAndReturnFalse(why); }
-   if(HasOpenPosition()) { AppendReason(why,"openPos"); return LogAndReturnFalse(why); }
 
+   // --- Data prerequisites ---
    MqlRates m15[3];
    if(!GetRates(PERIOD_M15,3,m15)) { AppendReason(why,"rates"); return LogAndReturnFalse(why); }
-
    double atr;
    if(!GetValue(hATR_M15,0,1,atr)) { AppendReason(why,"atr"); return LogAndReturnFalse(why); }
-
+   
+   // Spread check: stage 2 can optionally bypass
    int stage = LoosenStage();
-   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
-   bool spreadOk=true;
-   if(stage==2){
-      if(ask==0.0 || bid==0.0){ AppendReason(why,"noQuote"); spreadOk=false; }
-      else{
-         double spPts=(ask-bid)/_Point;
-         if(spPts > HardSpreadCapPts){ AppendReason(why,"spread>HARD"); spreadOk=false; }
-      }
-   }else{
-      if(!SpreadOK_Dynamic(atr)){ AppendReason(why,"spread>cap"); spreadOk=false; }
+   if(!(Stage2_IgnoresSpread && stage==2)){
+      if(!SpreadOK_Dynamic(atr)) { AppendReason(why,"spread>cap"); return LogAndReturnFalse(why); }
+   } else if(Diagnostics) {
+      PrintFormat("[Stage2] Bypassing spread check (stage=%d, trades=%d)", stage, TradesToday);
    }
-
+   
    if(!SessionAllowed()) { AppendReason(why,"session"); return LogAndReturnFalse(why); }
-
-   if(LossStreak_Protection && cooldownBarsRemaining>0){
-      AppendReason(why,"cooldown");
-      cooldownBarsRemaining--;
-      return LogAndReturnFalse(why);
-   }
+   if(HasOpenPosition()) { AppendReason(why,"openPos"); return LogAndReturnFalse(why); }
+   if(LossStreak_Protection && cooldownBarsRemaining>0) { AppendReason(why,"cooldown"); return LogAndReturnFalse(why); }
 
    double emaPull_1, emaStruct_1, emaFastH1, emaSlowH1;
-   if(!GetValue(hEMA_M15_pull,0,1,emaPull_1) || !GetValue(hEMA_M15_struct,0,1,emaStruct_1) || !GetValue(hEMA_H1_fast,0,1,emaFastH1) || !GetValue(hEMA_H1_slow,0,1,emaSlowH1)){
-      AppendReason(why,"ema");
-      return LogAndReturnFalse(why);
-   }
+   if(!GetValue(hEMA_M15_pull,0,1,emaPull_1) || !GetValue(hEMA_M15_struct,0,1,emaStruct_1) || !GetValue(hEMA_H1_fast,0,1,emaFastH1) || !GetValue(hEMA_H1_slow,0,1,emaSlowH1)) { AppendReason(why,"ema"); return LogAndReturnFalse(why); }
 
-   bool trendUp = (emaFastH1 > emaSlowH1);
-   bool trendDown = (emaFastH1 < emaSlowH1);
+   bool trendUp = emaFastH1 > emaSlowH1;
+   bool trendDown = emaFastH1 < emaSlowH1;
    if(Use_EMA200_Slope){
       if(trendUp && !TrendSlopeOK(true, emaSlowH1)){ AppendReason(why,"slopeLong"); trendUp=false; }
       if(trendDown && !TrendSlopeOK(false, emaSlowH1)){ AppendReason(why,"slopeShort"); trendDown=false; }
    }
 
    double macd_curr, macd_prev, rsi_curr, rsi_prev;
-   if(!GetValue(hMACD_M15,0,1,macd_curr) || !GetValue(hMACD_M15,0,2,macd_prev) || !GetValue(hRSI_M15,0,1,rsi_curr) || !GetValue(hRSI_M15,0,2,rsi_prev)){
-      AppendReason(why,"momData");
-      return LogAndReturnFalse(why);
-   }
+   if(!GetValue(hMACD_M15,0,1,macd_curr) || !GetValue(hMACD_M15,0,2,macd_prev) || !GetValue(hRSI_M15,0,1,rsi_curr) || !GetValue(hRSI_M15,0,2,rsi_prev)) { AppendReason(why,"momData"); return LogAndReturnFalse(why); }
 
    stage = LoosenStage();
-   bool macdUp   = (macd_prev<=0 && macd_curr>0);
-   bool macdDown = (macd_prev>=0 && macd_curr<0);
-   bool rsiUp    = (rsi_prev<50 && rsi_curr>50);
-   bool rsiDown  = (rsi_prev>50 && rsi_curr<50);
-   // Adaptive RSI midline by stage
-   int rsiMidRef = 50; if(stage==2) rsiMidRef = RSI_Mid_L2;
-   // Crosses OR slope/position around midline
-   bool longMomentumCore  = (macdUp || rsiUp);
-   bool shortMomentumCore = (macdDown || rsiDown);
-   // Add permissive alternative when not requiring both:
-   bool longAlt  = (rsi_curr > rsiMidRef+1.0 && macd_curr > macd_prev);
-   bool shortAlt = (rsi_curr < rsiMidRef-1.0 && macd_curr < macd_prev);
-   bool strictMomentum = (RequireBothMomentum && stage==0);
-   bool longMomentum  = (strictMomentum ? (macdUp && rsiUp) : (longMomentumCore || longAlt));
-   bool shortMomentum = (strictMomentum ? (macdDown && rsiDown) : (shortMomentumCore || shortAlt));
+   bool macdUp = (macd_prev<=0 && macd_curr>0);
+   bool macdDown=(macd_prev>=0 && macd_curr<0);
+   bool rsiUp = (rsi_prev<50 && rsi_curr>50);
+   bool rsiDown=(rsi_prev>50 && rsi_curr<50);
+   bool longMomentum = RequireBothMomentum ? (macdUp && rsiUp) : (macdUp || rsiUp);
+   bool shortMomentum= RequireBothMomentum ? (macdDown && rsiDown) : (macdDown || rsiDown);
 
-   // Stage-based thresholds
-   double minPullStage = (stage==0 ? Min_Pull_Depth_ATR : (stage==1 ? MathMin(Min_Pull_Depth_ATR,0.10) : MathMin(Min_Pull_Depth_ATR,0.05)));
-   double structBufATR = (stage==0 ? Structure_Buffer_ATR : (stage==1 ? Structure_Buffer_ATR*0.7 : Structure_Buffer_ATR*0.4)) * atr;
-   bool pullLong  = (m15[1].low  <= emaPull_1) && ((emaPull_1 - m15[1].low)  >= minPullStage * atr);
-   bool pullShort = (m15[1].high >= emaPull_1) && ((m15[1].high - emaPull_1) >= minPullStage * atr);
-   bool aboveStruct = m15[1].close > emaStruct_1 + structBufATR;
-   bool belowStruct = m15[1].close < emaStruct_1 - structBufATR;
+   bool pullLong = (m15[1].low <= emaPull_1) && ((emaPull_1 - m15[1].low) >= Min_Pull_Depth_ATR * atr);
+   bool pullShort= (m15[1].high >= emaPull_1) && ((m15[1].high - emaPull_1) >= Min_Pull_Depth_ATR * atr);
+   bool aboveStruct = m15[1].close > emaStruct_1 + Structure_Buffer_ATR * atr;
+   bool belowStruct = m15[1].close < emaStruct_1 - Structure_Buffer_ATR * atr;
 
-   double swingH = LastSwingHigh(SR_Lookback);
-   double swingL = LastSwingLow(SR_Lookback);
+   bool strengthUp=true,strengthDown=true; // permissive default
+   if(hADX!=INVALID_HANDLE){
+      double b0[],b1[],b2[];
+      if(CopyBuffer(hADX,0,0,1,b0)>0 && CopyBuffer(hADX,1,0,1,b1)>0 && CopyBuffer(hADX,2,0,1,b2)>0){
+         double adx0=b0[0], diPlus0=b1[0], diMinus0=b2[0];
+         strengthUp   = (adx0 >= Min_ADX && diPlus0 > diMinus0);
+         strengthDown = (adx0 >= Min_ADX && diMinus0 > diPlus0);
+      }
+   }
+
+   int    adxMin   = (stage==2? ADX_Min_L2 : stage==1? ADX_Min_L1 : ADX_Min_L0);
+   double ciMax    = (stage==2? CI_Max_L2  : stage==1? CI_Max_L1  : CI_Max_L0);
    double spaceATR = (stage==2? MinSpace_ATR_L2 : stage==1? MinSpace_ATR_L1 : MinSpace_ATR_L0);
-   bool spaceLong  = (swingH>0 && ask>0 ? (swingH-ask) >= spaceATR*atr : true);
-   bool spaceShort = (swingL>0 && bid>0 ? (bid-swingL) >= spaceATR*atr : true);
+   int    rsiMidRef= 50; if(stage==2) rsiMidRef = RSI_Mid_L2; // midline easing only stage2
+
+   double swingH=LastSwingHigh(SR_Lookback), swingL=LastSwingLow(SR_Lookback);
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK), bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   bool spaceLong = (swingH>0 && ask>0 ? (swingH-ask) >= spaceATR*atr : true);
+   bool spaceShort= (swingL>0 && bid>0 ? (bid-swingL) >= spaceATR*atr : true);
 
    // Compression Index gating
    double ci = ComputeCompressionIndex(20);
-   double ciMax    = (stage==2? CI_Max_L2  : stage==1? CI_Max_L1  : CI_Max_L0);
-   bool ciOK = (Disable_CI_Filter || ciMax<=0 || ci <= ciMax);
-   if(!ciOK) AppendReason(why,"ci");
+   bool ciOK = (ciMax<=0 || ci <= ciMax);
 
-   bool strengthUp=true, strengthDown=true;
-   int adxMin = (stage==2? ADX_Min_L2 : stage==1? ADX_Min_L1 : ADX_Min_L0);
-   bool enforceAdx = !(Stage2_OptionalADX && stage==2);
-   if(enforceAdx && hADX!=INVALID_HANDLE){
+   // Adjust ADX gating to stage thresholds (permissive)
+   if(hADX!=INVALID_HANDLE){
       double b0[],b1[],b2[];
       if(CopyBuffer(hADX,0,0,1,b0)>0 && CopyBuffer(hADX,1,0,1,b1)>0 && CopyBuffer(hADX,2,0,1,b2)>0){
          double adx0=b0[0], diPlus0=b1[0], diMinus0=b2[0];
@@ -579,175 +467,171 @@ bool TryEnter(){
          strengthDown = (adx0 >= adxMin && diMinus0 > diPlus0);
       }
    }
+   bool canLong = AllowLongs && trendUp && longMomentum && pullLong && aboveStruct && spaceLong && strengthUp && ciOK;
+   bool canShort= AllowShorts && trendDown && shortMomentum && pullShort && belowStruct && spaceShort && strengthDown && ciOK;
 
-   double histNow = MACDHistogram(1);
-   int longScore  = FeatureScoreLong(trendUp,longMomentum,pullLong,aboveStruct,spaceLong,strengthUp,ciOK,rsi_curr,histNow);
-   int shortScore = FeatureScoreShort(trendDown,shortMomentum,pullShort,belowStruct,spaceShort,strengthDown,ciOK,rsi_curr,histNow);
-   int need = ScoreThreshold(stage);
-   int stageBoost = ScoreStageBonus(stage);
-   if(stageBoost>0){
-      longScore  = MathMin(100,longScore  + stageBoost);
-      shortScore = MathMin(100,shortScore + stageBoost);
-   }
-
-   bool canBuy  = (AllowLongs  && longScore  >= need);
-   bool canSell = (AllowShorts && shortScore >= need);
-
-   if(!canBuy){
-      if(!trendUp) AppendReason(why,"noTrendLong");
+   if(!canLong && !canShort){
+   if(!trendUp) AppendReason(why,"noTrendLong");
       if(!longMomentum) AppendReason(why,"noMomLong");
       if(!pullLong) AppendReason(why,"noPullLong");
       if(!aboveStruct) AppendReason(why,"noStructLong");
       if(!spaceLong) AppendReason(why,"noSpaceLong");
       if(!strengthUp) AppendReason(why,"adxLong");
-      if(!ciOK) AppendReason(why,"ciLong");
-   }
-   if(!canSell){
+   if(!ciOK) AppendReason(why,"ci");
       if(!trendDown) AppendReason(why,"noTrendShort");
       if(!shortMomentum) AppendReason(why,"noMomShort");
       if(!pullShort) AppendReason(why,"noPullShort");
       if(!belowStruct) AppendReason(why,"noStructShort");
       if(!spaceShort) AppendReason(why,"noSpaceShort");
       if(!strengthDown) AppendReason(why,"adxShort");
-      if(!ciOK) AppendReason(why,"ciShort");
-   }
-
-   bool anySent=false;
-   bool doBuy=false, doSell=false;
-   if(canBuy && canSell){
-      if(longScore > shortScore) doBuy=true;
-      else if(shortScore > longScore) doSell=true;
-      else doBuy=true;
-   }else{
-      doBuy=canBuy;
-      doSell=canSell;
+   if(!ciOK) AppendReason(why,"ci");
+      return LogAndReturnFalse(why);
    }
 
    int stopLevel=(int)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
-   double minStopPrice = MathMax(PriceFromPoints(stopLevel + 5), MathMax(atr * MinStop_ATR, MinStop_Points * _Point));
-   double atrStopPrice = atr * ATR_SL_mult;
+   double minStopPts=stopLevel+5;
+   double atrStopPts=ATR_SL_mult*(atr/_Point);
 
-   if(spreadOk && (doBuy || doSell)){
-      trade.SetExpertMagicNumber(Magic);
-      trade.SetDeviationInPoints(50);
-      double atrPoints = (atr>0? atr/_Point : 0.0);
-      if(doBuy){
-         double defaultSLPrice = ask - atrStopPrice;
-         double swingSLPrice = (swingL>0? swingL - Swing_Buffer_ATR*atr : defaultSLPrice);
-         double chosenSL = (swingL>0? MathMin(defaultSLPrice,swingSLPrice): defaultSLPrice);
-         double stopDistPrice = MathMax(ask - chosenSL, minStopPrice);
-         double slBuy = NormalizePrice(ask - stopDistPrice);
-         double lotB = LotsByRiskSafe(stopDistPrice);
-         if(lotB>0){
-            double stopPts = PointsFromPrice(stopDistPrice);
-            double hi1 = m15[1].high;
-            if(Score_UseMarketForAlt){
-               if(trade.Buy(lotB,NULL,ask,slBuy,0.0,"ScoreLong")){
-                  partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atrPoints; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; anySent=true;
-               }
-            }else{
-               double pendingPrice = NormalizePrice(hi1 + PriceFromPoints(EntryBufferPts));
-               if(PointsFromPrice(pendingPrice - ask) < stopLevel + 10) pendingPrice = NormalizePrice(ask + PriceFromPoints(stopLevel + 10));
-               if(trade.BuyStop(lotB,_Symbol,pendingPrice,slBuy,0.0,"ScoreLong")){
-                  pendingTicket = trade.ResultOrder();
-                  pendingExpiryBars = PendingOrder_Expiry_Bars;
-                  pendingDirection = 1;
-                  signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=stopPts; entryATRPoints=atrPoints; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; anySent=true;
-               }
-            }
-         }else AppendReason(why,"noLotsLong");
-      }
-
-      if(!anySent && doSell){
-         double defaultSLPrice = bid + atrStopPrice;
-         double swingSLPrice = (swingH>0? swingH + Swing_Buffer_ATR*atr : defaultSLPrice);
-         double chosenSL = (swingH>0? MathMax(defaultSLPrice,swingSLPrice): defaultSLPrice);
-         double stopDistPrice = MathMax(chosenSL - bid, minStopPrice);
-         double slSell = NormalizePrice(bid + stopDistPrice);
-         double lotS = LotsByRiskSafe(stopDistPrice);
-         if(lotS>0){
-            double stopPts = PointsFromPrice(stopDistPrice);
-            double lo1 = m15[1].low;
-            if(Score_UseMarketForAlt){
-               if(trade.Sell(lotS,NULL,bid,slSell,0.0,"ScoreShort")){
-                  partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atrPoints; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; anySent=true;
-               }
-            }else{
-               double pendingPrice = NormalizePrice(lo1 - PriceFromPoints(EntryBufferPts));
-               if(PointsFromPrice(bid - pendingPrice) < stopLevel + 10) pendingPrice = NormalizePrice(bid - PriceFromPoints(stopLevel + 10));
-               if(trade.SellStop(lotS,_Symbol,pendingPrice,slSell,0.0,"ScoreShort")){
-                  pendingTicket = trade.ResultOrder();
-                  pendingExpiryBars = PendingOrder_Expiry_Bars;
-                  pendingDirection = 0;
-                  signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=stopPts; entryATRPoints=atrPoints; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; anySent=true;
-               }
-            }
-         }else AppendReason(why,"noLotsShort");
+   // --- Long Entry ---
+   if(canLong){
+      double structSLPrice=(swingL>0? swingL - Swing_Buffer_ATR*atr : ask - PriceFromPoints(atrStopPts));
+      double defaultSLPrice=ask-PriceFromPoints(atrStopPts);
+      double finalSLPrice=(swingL>0? MathMin(structSLPrice,defaultSLPrice):defaultSLPrice);
+      double rawStopPrice = ask - finalSLPrice;
+      double minStopPrice = MathMax(PriceFromPoints(minStopPts), MathMax(atr * MinStop_ATR, MinStop_Points * _Point));
+      double stopDistPrice = MathMax(rawStopPrice, minStopPrice);
+      double stopPts=PointsFromPrice(stopDistPrice);
+      double lots=LotsByRiskSafe(stopDistPrice);
+      if(lots<=0){ AppendReason(why,"noLots"); return LogAndReturnFalse(why); }
+      double sl=NormalizePrice(ask-stopDistPrice);
+      double tpR=TP2_R;
+      double tp=NormalizePrice(ask+PriceFromPoints(stopPts*tpR));
+      if(UseStopOrders){
+         double pendingPrice=NormalizePrice(m15[1].high + PriceFromPoints(EntryBufferPts_New));
+         if(PointsFromPrice(pendingPrice-ask) < stopLevel+10) pendingPrice=NormalizePrice(ask+PriceFromPoints(stopLevel+10));
+         MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
+         rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_BUY_STOP; rq.symbol=_Symbol; rq.volume=lots; rq.price=pendingPrice; rq.sl=sl; rq.tp=tp; rq.magic=Magic; rq.deviation=50; rq.type_filling=ORDER_FILLING_FOK;
+         if(OrderSend(rq,rs)){
+            pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=1; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=stopPts; entryATRPoints=atr/_Point; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; return true;
+         } else AppendReason(why,"buyStopFail");
+      } else {
+         trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50);
+         if(trade.Buy(lots,NULL,ask,sl,tp,"NF_Long")){
+            partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atr/_Point; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; TradesToday++; return true;
+         } else AppendReason(why,"buyFail");
       }
    }
 
-   if(!anySent){
-      if(DailyBracketON && !BracketPlacedToday && TradesToday < DailyMinTrades){
-         int hourNow = TimeHour(TimeCurrent());
-         if(hourNow >= ForceHour){
-            double dh = DC_High(DC_Period);
-            double dl = DC_Low(DC_Period);
-            double atrUse = atr;
-            if(atrUse<=0) atrUse = SymbolInfoDouble(_Symbol,SYMBOL_POINT) * 100;
-            double buf = DC_BufferPts * _Point;
-            double askNow=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-            double bidNow=SymbolInfoDouble(_Symbol,SYMBOL_BID);
-            double spPts = (askNow - bidNow)/_Point;
-            if(spPts <= HardSpreadCapPts && dh>0 && dl>0){
-               trade.SetExpertMagicNumber(Magic);
-               trade.SetDeviationInPoints(50);
-               double entryBuy = dh + buf;
-               double entrySell = dl - buf;
-               double slBuy = NormalizePrice(entryBuy - MathMax(atrUse * ATR_SL_mult, minStopPrice));
-               double slSell = NormalizePrice(entrySell + MathMax(atrUse * ATR_SL_mult, minStopPrice));
-               double lotB = LotsByRiskSafe(MathAbs(entryBuy - slBuy), FailSafe_RiskMult);
-               double lotS = LotsByRiskSafe(MathAbs(slSell - entrySell), FailSafe_RiskMult);
-               bool fsSent=false;
-               if(lotB>0){
-                  if(Bracket_UseStops){
-                     if(trade.BuyStop(lotB,_Symbol,NormalizePrice(entryBuy),slBuy,0.0,"ScoreFS-Buy")) fsSent=true;
-                  }else{
-                     if(trade.Buy(lotB,_Symbol,0.0,slBuy,0.0,"ScoreFS-Buy")) fsSent=true;
-                  }
+   // --- Short Entry ---
+   if(canShort){
+      double structSLPrice=(swingH>0? swingH + Swing_Buffer_ATR*atr : bid + PriceFromPoints(atrStopPts));
+      double defaultSLPrice=bid+PriceFromPoints(atrStopPts);
+      double finalSLPrice=(swingH>0? MathMax(structSLPrice,defaultSLPrice):defaultSLPrice);
+      double rawStopPrice = finalSLPrice - bid;
+      double minStopPrice = MathMax(PriceFromPoints(minStopPts), MathMax(atr * MinStop_ATR, MinStop_Points * _Point));
+      double stopDistPrice = MathMax(rawStopPrice, minStopPrice);
+      double stopPts=PointsFromPrice(stopDistPrice);
+      double lots=LotsByRiskSafe(stopDistPrice);
+      if(lots<=0){ AppendReason(why,"noLots"); return LogAndReturnFalse(why); }
+      double sl=NormalizePrice(bid+stopDistPrice);
+      double tpR=TP2_R; double tp=NormalizePrice(bid-PriceFromPoints(stopPts*tpR));
+      if(UseStopOrders){
+         double pendingPrice=NormalizePrice(m15[1].low - PriceFromPoints(EntryBufferPts_New));
+         if(PointsFromPrice(bid - pendingPrice) < stopLevel+10) pendingPrice=NormalizePrice(bid-PriceFromPoints(stopLevel+10));
+         MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
+         rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_SELL_STOP; rq.symbol=_Symbol; rq.volume=lots; rq.price=pendingPrice; rq.sl=sl; rq.tp=tp; rq.magic=Magic; rq.deviation=50; rq.type_filling=ORDER_FILLING_FOK;
+         if(OrderSend(rq,rs)){
+            pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=0; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=stopPts; entryATRPoints=atr/_Point; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; return true;
+         } else AppendReason(why,"sellStopFail");
+      } else {
+         trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50);
+         if(trade.Sell(lots,NULL,bid,sl,tp,"NF_Short")){
+            partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atr/_Point; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; TradesToday++; return true;
+         } else AppendReason(why,"sellFail");
+      }
+   }
+
+   // Secondary continuation-style permissive path (only if stage>0 and still below daily min trades)
+   if(EnableAltSignal && stage>0 && TradesToday < DailyMinTrades){
+      // Basic continuation conditions
+      bool altBuy = false, altSell=false;
+      
+      // Adaptive thresholds based on stage
+      int    adxMinAlt   = (stage==2? ADX_Min_L2 : ADX_Min_L1);
+      double ciMaxAlt    = (stage==2? CI_Max_L2  : CI_Max_L1);
+      double spaceATRAlt = (stage==2? Stage2_MinSpace_ATR : MinSpace_ATR_L1);
+      double rsiMidLine  = (stage==2? (double)RSI_Mid_L2 : 50.0);
+      
+      // ADX optional at stage 2
+      bool adxOKAlt = true;
+      if(!(Stage2_OptionalADX && stage==2)){
+         if(hADX!=INVALID_HANDLE){
+            double b0[],b1[],b2[];
+            if(CopyBuffer(hADX,0,0,1,b0)>0 && CopyBuffer(hADX,1,0,1,b1)>0 && CopyBuffer(hADX,2,0,1,b2)>0){
+               double adx0=b0[0], diPlus0=b1[0], diMinus0=b2[0];
+               adxOKAlt = (adx0 >= adxMinAlt);
+            }
+         }
+      }
+      
+      // Slope optional at stage 2
+      bool slopeUpOKAlt = (Stage2_IgnoreSlope && stage==2) ? true : TrendSlopeOK(true, emaSlowH1);
+      bool slopeDnOKAlt = (Stage2_IgnoreSlope && stage==2) ? true : TrendSlopeOK(false, emaSlowH1);
+      
+      // Price relations
+      double ema50=emaStruct_1; // using structure EMA as proxy 50
+      
+      // Re-evaluate simple momentum presence with adaptive filters
+      altBuy  = (m15[1].close > ema50 && emaFastH1>emaSlowH1 && (rsi_curr>=rsiMidLine || macd_curr>0) && adxOKAlt && ciOK && slopeUpOKAlt);
+      altSell = (m15[1].close < ema50 && emaFastH1<emaSlowH1 && (rsi_curr<=100.0-rsiMidLine || macd_curr<0) && adxOKAlt && ciOK && slopeDnOKAlt);
+      
+      // Structure space check (optional at stage 2)
+      if(!(Stage2_IgnoreStructure && stage==2)){
+         if(altBuy && !spaceLong) { AppendReason(why,"alt:no-space-long"); altBuy=false; }
+         if(altSell && !spaceShort) { AppendReason(why,"alt:no-space-short"); altSell=false; }
+      } else {
+         // Even at stage 2, do minimal space check with relaxed threshold
+         double swingHAlt=LastSwingHigh(SR_Lookback), swingLAlt=LastSwingLow(SR_Lookback);
+         if(altBuy && swingHAlt>0 && ask>0){
+            if((swingHAlt-ask) < spaceATRAlt*atr) { AppendReason(why,"alt:minimal-space-long"); altBuy=false; }
+         }
+         if(altSell && swingLAlt>0 && bid>0){
+            if((bid-swingLAlt) < spaceATRAlt*atr) { AppendReason(why,"alt:minimal-space-short"); altSell=false; }
+         }
+      }
+      if(altBuy || altSell){
+         int stopLevel2=(int)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
+         double atrPts = atr/_Point;
+         double rawStopPts = MathMax((double)stopLevel2+5.0, ATR_SL_mult * atrPts);
+         double rawStopPrice = PriceFromPoints(rawStopPts);
+         double minStopPrice = MathMax(PriceFromPoints((double)stopLevel2+5.0), MathMax(atr * MinStop_ATR, MinStop_Points * _Point));
+         double stopDistPrice = MathMax(rawStopPrice, minStopPrice);
+         double ask2=ask, bid2=bid; double slLong=NormalizePrice(ask2-stopDistPrice); double slShort=NormalizePrice(bid2+stopDistPrice);
+         double lotsAlt = LotsByRiskSafe(stopDistPrice);
+         if(lotsAlt>0){
+            if(Alt_UseStopOrders){
+               double hi1=m15[1].high, lo1=m15[1].low; double buf=PriceFromPoints(Alt_EntryBufferPts);
+               if(altBuy){
+                  MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
+                  rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_BUY_STOP; rq.symbol=_Symbol; rq.volume=lotsAlt; rq.price=NormalizePrice(hi1+buf); if(PointsFromPrice(rq.price-ask2)<stopLevel2+10) rq.price=NormalizePrice(ask2+PriceFromPoints(stopLevel2+10)); rq.sl=slLong; rq.tp=0; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK; if(OrderSend(rq,rs)){ pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=1; signalHigh=m15[1].high; signalLow=m15[1].low; }
                }
-               if(lotS>0){
-                  if(Bracket_UseStops){
-                     if(trade.SellStop(lotS,_Symbol,NormalizePrice(entrySell),slSell,0.0,"ScoreFS-Sell")) fsSent=true;
-                  }else{
-                     if(trade.Sell(lotS,_Symbol,0.0,slSell,0.0,"ScoreFS-Sell")) fsSent=true;
-                  }
+               if(altSell){
+                  MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
+                  rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_SELL_STOP; rq.symbol=_Symbol; rq.volume=lotsAlt; rq.price=NormalizePrice(lo1-buf); if(PointsFromPrice(bid2-rq.price)<stopLevel2+10) rq.price=NormalizePrice(bid2-PriceFromPoints(stopLevel2+10)); rq.sl=slShort; rq.tp=0; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK; if(OrderSend(rq,rs)){ pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=0; signalHigh=m15[1].high; signalLow=m15[1].low; }
                }
-               if(fsSent){
-                  BracketPlacedToday=true;
-                  AppendReason(why,"failsafe:bracket");
-                  anySent=true;
-               }
-            }else AppendReason(why,"failsafe:spread>HARD");
+            } else {
+               trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50);
+               if(altBuy){ if(trade.Buy(lotsAlt,NULL,ask2,slLong,0,"Alt_Long")){ TradesToday++; return true; } }
+               if(altSell){ if(trade.Sell(lotsAlt,NULL,bid2,slShort,0,"Alt_Short")){ TradesToday++; return true; } }
+            }
          }
       }
    }
 
-   if(pendingTicket>0){
-      if(pendingExpiryBars<=0){
-         if(OrderSelect(pendingTicket)){
-            if(OrderGetInteger(ORDER_STATE)==ORDER_STATE_PLACED){
-               MqlTradeRequest rr; MqlTradeResult rres; ZeroMemory(rr); ZeroMemory(rres);
-               rr.action=TRADE_ACTION_REMOVE; rr.order=pendingTicket;
-               OrderSend(rr,rres);
-            }
-         }
-         pendingTicket=0; pendingDirection=-1;
-      }else pendingExpiryBars--;
-   }
-
-   if(anySent) return true;
+   // If we reach here, no entry was possible
    return LogAndReturnFalse(why);
 }
+
 // Helper function to log and return false
 bool LogAndReturnFalse(const string why){
    if(Diagnostics && StringLen(why)>0)
@@ -756,7 +640,7 @@ bool LogAndReturnFalse(const string why){
 }
 
 // Compute lot size from % risk and stop distance (in price units)
-double LotsByRiskSafe(double stopDistPrice,double riskMult=1.0){
+double LotsByRiskSafe(double stopDistPrice){
    if(stopDistPrice<=0.0) return 0.0;
 
    double atr=0.0;
@@ -782,7 +666,7 @@ double LotsByRiskSafe(double stopDistPrice,double riskMult=1.0){
    if(pp<=0.0) return 0.0;
 
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-   double riskMoney = eq * (Risk_Percent/100.0) * MathMax(0.0, riskMult);
+   double riskMoney = eq * (Risk_Percent/100.0);
    double lossPerLot = pp * (sd/_Point);
    if(lossPerLot<=0.0) return 0.0;
 
@@ -792,16 +676,12 @@ double LotsByRiskSafe(double stopDistPrice,double riskMult=1.0){
    double maxLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
    double step  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
 
-   double maxAllowed = MathMin(maxLot, MaxRiskLotsCap);
-   lots = MathMin(maxAllowed, lots);
+   lots = MathMax(minLot, MathMin(MathMin(maxLot, MaxRiskLotsCap), lots));
 
    if(step>0.0)
       lots = MathFloor(lots/step) * step;
 
-   if(lots < minLot)
-      return 0.0;
-
-   lots = MathMin(maxAllowed, lots);
+   lots = MathMax(minLot, MathMin(MathMin(maxLot, MaxRiskLotsCap), lots));
 
    return NormalizeDouble(lots,2);
 }
@@ -1084,59 +964,37 @@ void OnDeinit(const int reason){
 }
 
 void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& request,const MqlTradeResult& result){
-   if(trans.type!=TRADE_TRANSACTION_DEAL_ADD) return;
-
-   ulong dealId = trans.deal;
-   if(!HistorySelect(TimeCurrent()-86400*30, TimeCurrent())) return; // last 30 days
-   if(!HistoryDealSelect(dealId)) return;
-
-   long magic = (long)HistoryDealGetInteger(dealId, DEAL_MAGIC);
-   if((ulong)magic != Magic) return;
-
-   long entryType = HistoryDealGetInteger(dealId, DEAL_ENTRY);
-   if(entryType == DEAL_ENTRY_IN){
-      TradesToday++;
-      if(PositionSelect(_Symbol) && (ulong)PositionGetInteger(POSITION_MAGIC)==Magic){
-         double open=PositionGetDouble(POSITION_PRICE_OPEN);
-         double sl=PositionGetDouble(POSITION_SL);
-         entryStopPoints = PointsFromPrice(MathAbs(open - sl));
-         double atrNow=0.0; if(GetValue(hATR_M15,0,1,atrNow)) entryATRPoints = PointsFromPrice(atrNow); else entryATRPoints=0.0;
-         entryTime = TimeCurrent();
-         partialTaken=false; secondPartialTaken=false; structureBreakOccurred=false; beMoved=false;
-         signalHigh=0.0; signalLow=0.0;
-      }
-      for(int i=(int)OrdersTotal()-1;i>=0;--i){
-         if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES)){
-            string comment = OrderGetString(ORDER_COMMENT);
-            if(StringFind(comment,"ScoreFS-")>=0){
-               ENUM_ORDER_TYPE ot = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-               if(ot==ORDER_TYPE_BUY_STOP || ot==ORDER_TYPE_SELL_STOP){
-                  ulong ticket = (ulong)OrderGetInteger(ORDER_TICKET);
-                  trade.OrderDelete(ticket);
-               }
-            }
-         }
-      }
-   }
-
    if(!LossStreak_Protection) return;
-
-   if(entryType == DEAL_ENTRY_OUT){
-      double profit = HistoryDealGetDouble(dealId, DEAL_PROFIT) + HistoryDealGetDouble(dealId, DEAL_SWAP) + HistoryDealGetDouble(dealId, DEAL_COMMISSION);
-      if(profit < 0){
-         consecutiveLosses++;
-         if(consecutiveLosses >= Max_Loss_Streak){
-            cooldownBarsRemaining = Loss_Cooldown_Bars;
-            if(Enable_Diagnostics) Print("[Diag] Loss streak triggered cooldown bars=",cooldownBarsRemaining);
-            consecutiveLosses = 0; // reset after triggering
+   // monitor deal additions closing positions
+   if(trans.type==TRADE_TRANSACTION_DEAL_ADD){
+      ulong dealId = trans.deal;
+      if(!HistorySelect(TimeCurrent()-86400*30, TimeCurrent())) return; // last 30 days
+      if(!HistoryDealSelect(dealId)) return;
+      long magic = (long)HistoryDealGetInteger(dealId, DEAL_MAGIC);
+      if((ulong)magic != Magic) return;
+      long entryType = HistoryDealGetInteger(dealId, DEAL_ENTRY);
+      if(entryType == DEAL_ENTRY_IN){
+         // position opened (market or pending fill)
+         TradesToday++;
+      }
+      if(entryType == DEAL_ENTRY_OUT){
+         double profit = HistoryDealGetDouble(dealId, DEAL_PROFIT) + HistoryDealGetDouble(dealId, DEAL_SWAP) + HistoryDealGetDouble(dealId, DEAL_COMMISSION);
+         if(profit < 0){
+            consecutiveLosses++;
+            if(consecutiveLosses >= Max_Loss_Streak){
+               cooldownBarsRemaining = Loss_Cooldown_Bars;
+               if(Enable_Diagnostics) Print("[Diag] Loss streak triggered cooldown bars=",cooldownBarsRemaining);
+               consecutiveLosses = 0; // reset after triggering
+            }
+         } else if(profit > 0){
+            consecutiveLosses = 0; // reset on win
          }
-      } else if(profit > 0){
-         consecutiveLosses = 0; // reset on win
       }
    }
 }
 
 void OnTick(){
+   ResetDailyCounters();
    // manage open trade each tick
    ManagePartialAndTrail();
 
@@ -1148,16 +1006,9 @@ void OnTick(){
       }
    }
 
-   bool newBar = NewM15Bar();
-   if(!newBar) return; // only evaluate entries once per new M15 bar
-
-   ResetDailyCounters();
+   if(!NewM15Bar()) return; // only evaluate entries once per new M15 bar
    barsProcessed++; bool verboseBar = (Enable_Diagnostics && Verbose_First_N && (barsProcessed <= (ulong)Verbose_Bars_Limit));
    if(Diagnostics) PrintStageInfo(LoosenStage());
-   if(Diagnostics && (barsProcessed % 16)==0){
-      double ci_dbg = ComputeCompressionIndex(20);
-      PrintFormat("[Diag] CI=%.1f (Disable_CI_Filter=%s)", ci_dbg, (Disable_CI_Filter?"true":"false"));
-   }
 
    // New entry flow (lenient/quality presets)
    if(Use_New_Entry_Flow){
