@@ -27,24 +27,26 @@ input double   MaxRiskLotsCap  = 0.10;     // hard cap per trade
 input double   MinStop_ATR     = 1.0;      // ensure SL distance >= 1×ATR
 input double   MinStop_Points  = 50.0;     // absolute floor in points
 input int      ATR_Period      = 14;
-input double   ATR_SL_mult     = 2.5;      // SL = max(ATR*mult, swing buffer)
+input double   ATR_SL_mult     = 2.2;      // SL = max(ATR*mult, swing buffer)
 input double   Swing_Buffer_ATR= 0.20;     // extra beyond fractal (as ATR multiple)
 input double   TP1_R           = 1.0;      // first partial (tighter for faster risk reduction)
 input double   TP2_R           = 2.2;      // second partial / scale-out point
 input double   TP3_R           = 3.2;      // runner target
 input bool     Use_TP3         = true;     // enable third target
-input double   TP1_Close_Pct   = 0.55;     // portion to close at TP1
+input double   TP1_Close_Pct   = 0.50;     // portion to close at TP1
 input double   TP2_Close_Pct   = 0.35;     // portion to close at TP2 (rest trails / TP3)
 input bool     Adaptive_R_Targets = true;  // adjust TP2/TP3 with volatility regime
 input int      ATR_Regime_Period  = 50;    // ATR SMA period for regime calc
 input double   HighVolRatio       = 1.25;  // ATR / ATR_SMA > this => high vol (stretch targets)
 input double   LowVolRatio        = 0.85;  // ATR / ATR_SMA < this => low vol (contract targets)
+input double   ATR_Regime_Max_Ratio = 1.8;  // skip entries if ATR/ATR_SMA exceeds (too chaotic)
+input double   ATR_Regime_Min_Ratio = 0.75; // skip entries if ATR/ATR_SMA below (too quiet)
 input double   HighVol_Target_Boost = 0.5; // add to TP2/TP3 R
 input double   LowVol_Target_Reduction = 0.3; // subtract from TP2/TP3 R
 input bool     Use_Trailing    = true;     // chandelier trail after BE
 input double   Trail_ATR_mult  = 3.0;      // base trail
 input double   Trail_Tight_ATR_mult = 2.4; // tighter trail beyond trigger R
-input double   Trail_Tighten_Trigger_R = 2.8; // tighten trail after this R
+input double   Trail_Tighten_Trigger_R = 2.0; // tighten trail after this R
 input bool     Use_Time_Exit   = true;     // exit stale trades
 input int      Max_Bars_In_Trade = 120;    // close if trade exceeds this many M15 bars (~30h)
 input bool     Use_Vol_Compress_Exit = true; // exit if volatility collapses
@@ -62,7 +64,7 @@ input bool     Use_Session_Filter     = false;  // Restrict trading to session h
 input int      Session_Start_Hour     = 6;      // Session start (server time)
 input int      Session_End_Hour       = 20;     // Session end
 input bool     DelayTrailUntilPartial = true;   // Do not trail until partial profit
-input double   Trail_Start_R          = 2.2;    // Start trailing only after this R reached if partial not yet
+input double   Trail_Start_R          = 1.5;    // Start trailing only after this R reached if partial not yet
 input group "=== Diagnostics ==="
 input bool     Enable_Diagnostics     = true;   // Turn on rejection counting
 input int      Diagnostics_Every_Bars = 96;     // Print summary every N processed M15 bars (~1 day if 96)
@@ -86,7 +88,7 @@ input double   RSI_Max_Short          = 48.5;   // require RSI below this for sh
 input double   MACD_Min_Abs           = 0.07;   // min absolute MACD main beyond zero
 
 input group "=== Pullback / Structure Quality ==="
-input double   Min_Pull_Depth_ATR     = 0.18;   // minimum pullback depth as ATR fraction
+input double   Min_Pull_Depth_ATR     = 0.10;   // minimum pullback depth as ATR fraction
 input double   Structure_Buffer_ATR   = 0.06;   // close must clear structure EMA by this ATR
 input bool     Use_Structure_Space    = true;   // Minimum space filter to next structure
 input double   MinSpace_ATR           = 0.30;    // minimum ATR headroom
@@ -111,8 +113,8 @@ input double   Spread_ATR_Fraction    = 0.20;   // allowed spread = % of ATR (po
 input int      HardSpreadCapPts       = 400;    // absolute safety ceiling
 input bool     Stage2_IgnoresSpread   = false;  // bypass spread check at stage 2 when no trades yet
 input bool     Enhanced_Session_Filter= true;   // refined session rules (DISABLED for 24h trading)
-input int      LondonNY_Start_Hour    = 7;      // Session start (0=all day)
-input int      LondonNY_End_Hour      = 19;     // Session end (24=all day)
+input int      LondonNY_Start_Hour    = 6;      // Session start (0=all day)
+input int      LondonNY_End_Hour      = 20;     // Session end (24=all day)
 input bool     Skip_Monday_Asian      = true;   // DISABLED for more opportunities
 input int      Monday_Skip_Until_Hour = 3;
 input bool     Skip_Friday_Late       = true;   // DISABLED for more opportunities
@@ -163,6 +165,15 @@ input double   Quota_Risk_Factor        = 0.40;   // fraction of normal risk for
 input double   Quota_Min_ATR_Points     = 350.0;  // min ATR(points) to avoid dead markets
 input double   Quota_MaxSpread_ATR_Frac = 0.30;   // spread must be <= this * ATR(points)
 
+input group "=== Probe Trade Access ==="
+input bool     Enable_Probe_Trade         = true;   // If no trade yet today and equity filter pauses, allow one reduced-risk probe
+input double   Probe_Risk_Factor          = 0.30;   // Probe trades use 30% of normal risk
+input double   Probe_ADX_Min              = 22.0;
+input double   Probe_H1_Separation_MinPts = 35.0;
+input double   Probe_Min_ATR_Points       = 120.0;  // Minimum ATR points on M15 to avoid dead ranges
+input int      Probe_EarlyAbort_Bars      = 2;
+input double   Probe_EarlyAbort_R         = 0.5;
+
 input group "=== Safety & Quota Guards ==="
 input double   DailyRiskMaxPct          = 3.0;    // Max % of BALANCE allowed to lose in a single day; block new entries when exceeded.
 input double   WeeklyRiskMaxPct         = 6.0;    // Max % of BALANCE allowed to lose in rolling 5 trading days.
@@ -175,7 +186,7 @@ input double   EarlyAbort_R             = 0.6;    // Adverse R threshold to trig
 input int      EarlyAbort_Bars          = 3;      // If adverse move reaches 0.6R within N bars after entry, bail early.
 input bool     Enable_Equity_Filter     = true;   // Sliding window equity filter gate before entries.
 input int      Equity_WinRate_Window    = 10;     // Trades window for equity/winrate filter.
-input double   Equity_Min_WinRate       = 0.35;   // If win rate in the last N trades falls below, pause entries until next day.
+input double   Equity_Min_WinRate       = 0.33;   // If win rate in the last N trades falls below, pause entries until next day.
 
 input group "=== Compression Gate ==="
 input double CI_Min_L0 = 0.80;  // Stage0: require at least mild compression
@@ -211,6 +222,9 @@ double   entryATRPoints = 0.0;      // ATR points at entry
 double   entryStopPoints= 0.0;      // stop distance at entry (points)
 double   entryTP2_R     = 0.0;      // stored adapted TP2 R
 double   entryTP3_R     = 0.0;      // stored adapted TP3 R
+bool     equityGateLast = false;    // track last equity gate state
+int      probeBarsSinceEntry = 0;
+double   probeStopPts = 0.0;
 datetime entryTime      = 0;        // entry time for time/vol exits
 int      WinsLong30     = 0, TradesLong30 = 0, WinsShort30 = 0, TradesShort30 = 0;
 bool     AllowLongsAuto = true, AllowShortsAuto = true;
@@ -268,6 +282,8 @@ double LotsByRiskSafe(double stopPts);
 bool EquityFilterOK();
 bool RiskBudgetOK();
 bool QuotaEnvironmentOK();
+bool AtrRegimeAcceptable();
+bool EnforceProbeTrade();
 
 void DiagnosticsPrintSummary(){
    if(!Enable_Diagnostics) return;
@@ -354,6 +370,164 @@ bool TrendSlopeOK(bool longSide,double emaSlowNow){
    return (deltaPts < -MinSlopePts);
 }
 
+bool AtrRegimeAcceptable(){
+   double atrNow=0.0;
+   if(!GetValue(hATR_M15,0,1,atrNow))
+      return true;
+
+   int n = MathMax(ATR_Regime_Period, 30);
+   double arr[];
+   ArraySetAsSeries(arr, true);
+   if(CopyBuffer(hATR_M15,0,1,n,arr) != n)
+      return true;
+
+   double sum=0.0;
+   for(int i=0;i<n;i++)
+      sum+=arr[i];
+
+   double sma = (n>0 ? sum/n : atrNow);
+   if(sma<=0.0)
+      return true;
+
+   double ratio = atrNow / sma;
+   return (ratio >= ATR_Regime_Min_Ratio && ratio <= ATR_Regime_Max_Ratio);
+}
+
+bool EnforceProbeTrade(){
+   if(!Enable_Probe_Trade)
+      return false;
+   if(TradesToday >= 1)
+      return false;
+   if(pendingTicket>0)
+      return false;
+   if(!RiskBudgetOK())
+      return false;
+   if(!AtrRegimeAcceptable())
+      return false;
+
+   if(hADX!=INVALID_HANDLE)
+   {
+      double a0[];
+      if(CopyBuffer(hADX,0,0,1,a0)>0)
+      {
+         if(a0[0] < Probe_ADX_Min)
+            return false;
+      }
+   }
+
+   double fast=0.0, slow=0.0;
+   if(!GetValue(hEMA_H1_fast,0,1,fast) || !GetValue(hEMA_H1_slow,0,1,slow))
+      return false;
+   if(MathAbs(PointsFromPrice(fast-slow)) < Probe_H1_Separation_MinPts)
+      return false;
+
+   MqlRates m15[3];
+   if(!GetRates(PERIOD_M15,3,m15))
+      return false;
+
+   double emaStruct=0.0;
+   if(!GetValue(hEMA_M15_struct,0,1,emaStruct))
+      return false;
+
+   double rsi=0.0, macd=0.0;
+   if(!GetValue(hRSI_M15,0,1,rsi) || !GetValue(hMACD_M15,0,1,macd))
+      return false;
+
+   double atr=0.0;
+   if(!GetValue(hATR_M15,0,1,atr))
+      return false;
+   double atrPts = (atr>0.0 ? atr/_Point : 0.0);
+   if(atrPts < Probe_Min_ATR_Points)
+      return false;
+
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   if(ask<=0.0 || bid<=0.0)
+      return false;
+   double spreadPts = (ask-bid)/_Point;
+   if(spreadPts > 0.25*atrPts)
+      return false;
+
+   bool up = (fast>slow);
+   bool dn = (fast<slow);
+   bool wantLong  = up && rsi>=50.0 && macd>0.0 && m15[1].close>emaStruct;
+   bool wantShort = dn && rsi<=50.0 && macd<0.0 && m15[1].close<emaStruct;
+   if(!wantLong && !wantShort)
+      return false;
+
+   int stopLevel=(int)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
+   double useStopPts = MathMax((double)stopLevel+5.0, ATR_SL_mult * atrPts);
+   double baseLots = LotsFromRisk(useStopPts);
+   double lots = baseLots * Probe_Risk_Factor;
+   double minLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double stepLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   if(stepLot>0.0)
+      lots = stepLot * MathFloor(lots/stepLot + 0.5);
+   if(minLot>0.0)
+      lots = MathMax(minLot, MathMin(baseLots, lots));
+   if(lots <= 0.0)
+      return false;
+
+   double sl_buy  = NormalizePrice(ask - PriceFromPoints(useStopPts));
+   double sl_sell = NormalizePrice(bid + PriceFromPoints(useStopPts));
+   double tpR = TP2_R;
+   double tp_buy  = NormalizePrice(ask + PriceFromPoints(useStopPts*tpR));
+   double tp_sell = NormalizePrice(bid - PriceFromPoints(useStopPts*tpR));
+
+   MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
+   rq.action=TRADE_ACTION_PENDING; rq.symbol=_Symbol; rq.volume=lots; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK;
+
+   bool placed=false;
+   int  dir=-1;
+   if(wantLong)
+   {
+      rq.type=ORDER_TYPE_BUY_STOP;
+      rq.price=NormalizePrice(m15[1].high + PriceFromPoints(MathMax(EntryBufferPts,10)));
+      if(PointsFromPrice(rq.price-ask) < stopLevel+10)
+         rq.price = NormalizePrice(ask + PriceFromPoints(stopLevel+10));
+      rq.sl=sl_buy; rq.tp=tp_buy;
+      if(OrderSend(rq,rs))
+      {
+         placed=true;
+         dir=1;
+      }
+   }
+
+   if(!placed && wantShort)
+   {
+      rq.type=ORDER_TYPE_SELL_STOP;
+      rq.price=NormalizePrice(m15[1].low - PriceFromPoints(MathMax(EntryBufferPts,10)));
+      if(PointsFromPrice(bid-rq.price) < stopLevel+10)
+         rq.price = NormalizePrice(bid - PriceFromPoints(stopLevel+10));
+      rq.sl=sl_sell; rq.tp=tp_sell;
+      if(OrderSend(rq,rs))
+      {
+         placed=true;
+         dir=0;
+      }
+   }
+
+   if(!placed)
+      return false;
+
+   pendingTicket=rs.order;
+   pendingExpiryBars=PendingOrder_Expiry_Bars;
+   pendingDirection = dir;
+   signalHigh=m15[1].high;
+   signalLow =m15[1].low;
+   partialTaken=false;
+   secondPartialTaken=false;
+   entryStopPoints=useStopPts;
+   entryATRPoints=atrPts;
+   entryTime=TimeCurrent();
+   structureBreakOccurred=false;
+   beMoved=false;
+   probeStopPts=useStopPts;
+   probeBarsSinceEntry=0;
+   equityGateLast=true;
+   return true;
+}
+
 // (TryEnter moved below utility function definitions)
 
 bool GetValue(int handle,int buffer,int shift,double &out){
@@ -419,6 +593,9 @@ void ResetDailyCounters(){
       barsSinceEntry = 0;
       lastEntryStopPts = 0.0;
       lastEntryBarTime = 0;
+      equityGateLast = false;
+      probeBarsSinceEntry = 0;
+      probeStopPts = 0.0;
     }
  }
 
@@ -585,6 +762,8 @@ bool EnforceDailyTradeQuota(){
          beMoved=false;
          quotaPendingTicket=rs.order;
          quotaTradeActive=false;
+         probeStopPts=0.0;
+         probeBarsSinceEntry=0;
          placed=true;
       }
    }
@@ -612,6 +791,8 @@ bool EnforceDailyTradeQuota(){
          beMoved=false;
          quotaPendingTicket=rs.order;
          quotaTradeActive=false;
+         probeStopPts=0.0;
+         probeBarsSinceEntry=0;
          placed=true;
       }
    }
@@ -656,7 +837,16 @@ void PrintStageInfo(int stage){
 bool TryEnter(){
    string why="";
 
-   if(!RiskBudgetOK() || !EquityFilterOK()) return LogAndReturnFalse("budget/equity-gate");
+   // Budget cannot be bypassed
+   if(!RiskBudgetOK()) return LogAndReturnFalse("budget-gate");
+   // Equity-gate: if paused and we still need our daily minimum, allow ONE probe trade under strict rules
+   equityGateLast = !EquityFilterOK();
+   if(equityGateLast){
+      if(Enable_Probe_Trade && TradesToday < 1){
+         if(EnforceProbeTrade()) return true;
+      }
+      return LogAndReturnFalse("equity-gate");
+   }
 
    // --- MinBars Guard: Prevent early-begin history artifact ---
    if(Bars(_Symbol,PERIOD_M15) < MinBarsForSignals){ AppendReason(why,"minBars"); return LogAndReturnFalse(why); }
@@ -810,12 +1000,12 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
          MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
          rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_BUY_STOP; rq.symbol=_Symbol; rq.volume=lots; rq.price=pendingPrice; rq.sl=sl; rq.tp=tp; rq.magic=Magic; rq.deviation=50; rq.type_filling=ORDER_FILLING_FOK;
          if(OrderSend(rq,rs)){
-            pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=1; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=stopPts; entryATRPoints=atrPts; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; return true;
+            pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=1; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=stopPts; entryATRPoints=atrPts; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; probeStopPts=0.0; probeBarsSinceEntry=0; return true;
          } else AppendReason(why,"buyStopFail");
       } else {
          trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50);
          if(trade.Buy(lots,NULL,ask,sl,tp,"NF_Long")){
-            partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atrPts; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; TradesToday++; return true;
+            partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atrPts; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; TradesToday++; probeStopPts=0.0; probeBarsSinceEntry=0; return true;
          } else AppendReason(why,"buyFail");
       }
    }
@@ -840,12 +1030,12 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
          MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
          rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_SELL_STOP; rq.symbol=_Symbol; rq.volume=lots; rq.price=pendingPrice; rq.sl=sl; rq.tp=tp; rq.magic=Magic; rq.deviation=50; rq.type_filling=ORDER_FILLING_FOK;
          if(OrderSend(rq,rs)){
-            pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=0; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=stopPts; entryATRPoints=atrPts; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; return true;
+            pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=0; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=stopPts; entryATRPoints=atrPts; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; probeStopPts=0.0; probeBarsSinceEntry=0; return true;
          } else AppendReason(why,"sellStopFail");
       } else {
          trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50);
          if(trade.Sell(lots,NULL,bid,sl,tp,"NF_Short")){
-            partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atrPts; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; TradesToday++; return true;
+            partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atrPts; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; TradesToday++; probeStopPts=0.0; probeBarsSinceEntry=0; return true;
          } else AppendReason(why,"sellFail");
       }
    }
@@ -937,11 +1127,35 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
                double buf=PriceFromPoints(bufPts);
                if(altBuy){
                   MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
-                  rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_BUY_STOP; rq.symbol=_Symbol; rq.volume=lotsAlt; rq.price=NormalizePrice(channelHigh+buf); if(PointsFromPrice(rq.price-ask2)<stopLevel2+10) rq.price=NormalizePrice(ask2+PriceFromPoints(stopLevel2+10)); rq.sl=slLong; rq.tp=0; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK; if(OrderSend(rq,rs)){ pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=1; signalHigh=m15[1].high; signalLow=m15[1].low; }
+                  rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_BUY_STOP; rq.symbol=_Symbol; rq.volume=lotsAlt; rq.price=NormalizePrice(channelHigh+buf);
+                  if(PointsFromPrice(rq.price-ask2)<stopLevel2+10)
+                     rq.price=NormalizePrice(ask2+PriceFromPoints(stopLevel2+10));
+                  rq.sl=slLong; rq.tp=0; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK;
+                  if(OrderSend(rq,rs)){
+                     pendingTicket=rs.order;
+                     pendingExpiryBars=PendingOrder_Expiry_Bars;
+                     pendingDirection=1;
+                     signalHigh=m15[1].high;
+                     signalLow=m15[1].low;
+                     probeStopPts=0.0;
+                     probeBarsSinceEntry=0;
+                  }
                }
                if(altSell){
                   MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
-                  rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_SELL_STOP; rq.symbol=_Symbol; rq.volume=lotsAlt; rq.price=NormalizePrice(channelLow-buf); if(PointsFromPrice(bid2-rq.price)<stopLevel2+10) rq.price=NormalizePrice(bid2-PriceFromPoints(stopLevel2+10)); rq.sl=slShort; rq.tp=0; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK; if(OrderSend(rq,rs)){ pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=0; signalHigh=m15[1].high; signalLow=m15[1].low; }
+                  rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_SELL_STOP; rq.symbol=_Symbol; rq.volume=lotsAlt; rq.price=NormalizePrice(channelLow-buf);
+                  if(PointsFromPrice(bid2-rq.price)<stopLevel2+10)
+                     rq.price=NormalizePrice(bid2-PriceFromPoints(stopLevel2+10));
+                  rq.sl=slShort; rq.tp=0; rq.deviation=50; rq.magic=Magic; rq.type_filling=ORDER_FILLING_FOK;
+                  if(OrderSend(rq,rs)){
+                     pendingTicket=rs.order;
+                     pendingExpiryBars=PendingOrder_Expiry_Bars;
+                     pendingDirection=0;
+                     signalHigh=m15[1].high;
+                     signalLow=m15[1].low;
+                     probeStopPts=0.0;
+                     probeBarsSinceEntry=0;
+                  }
                }
             } else {
                trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50);
@@ -950,6 +1164,12 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
             }
          }
       }
+   }
+
+   // If nothing fired and we still have 0 trades by midday, try probe once
+   MqlDateTime _dt; TimeCurrent(_dt);
+   if(Enable_Probe_Trade && TradesToday<1 && _dt.hour>=11 && _dt.hour<=18){
+      if(EnforceProbeTrade()) return true;
    }
 
    // If we reach here, no entry was possible
@@ -1105,8 +1325,29 @@ bool SessionAllowed(){
 }
 
 void ManagePartialAndTrail(){
-   if(!PositionSelect(_Symbol)) { partialTaken=false; secondPartialTaken=false; return; }
+   if(!PositionSelect(_Symbol)) { partialTaken=false; secondPartialTaken=false; probeBarsSinceEntry=0; probeStopPts=0.0; return; }
    if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) return;
+
+   // Probe early abort within first N bars
+   probeBarsSinceEntry++;
+   if(equityGateLast && TradesToday<=1 && probeStopPts>0.0){
+      if(probeBarsSinceEntry <= Probe_EarlyAbort_Bars){
+         long t = (long)PositionGetInteger(POSITION_TYPE);
+         double openP = PositionGetDouble(POSITION_PRICE_OPEN);
+         double bidP=SymbolInfoDouble(_Symbol,SYMBOL_BID), askP=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+         double curP = (t==POSITION_TYPE_BUY? bidP: askP);
+         double adversePts = PointsFromPrice(MathMax(0.0, (t==POSITION_TYPE_BUY? openP-curP : curP-openP)));
+         if(adversePts >= Probe_EarlyAbort_R * probeStopPts){
+            trade.SetExpertMagicNumber(Magic);
+            trade.PositionClose(_Symbol);
+            probeStopPts=0.0;
+            probeBarsSinceEntry=0;
+            partialTaken=false;
+            secondPartialTaken=false;
+            return;
+         }
+      }
+   }
 
    datetime currentBarTime = iTime(_Symbol,PERIOD_M15,0);
    if(lastEntryBarTime==0)
@@ -1409,6 +1650,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
       barsSinceEntry = 0;
       lastEntryStopPts = entryStopPoints;
       lastEntryBarTime = iTime(_Symbol,PERIOD_M15,0);
+      probeBarsSinceEntry = 0;
       if(quotaPendingTicket>0 && trans.order == quotaPendingTicket){
          quotaTradeActive = true;
          quotaPendingTicket = 0;
@@ -1439,6 +1681,9 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
     barsSinceEntry = 0;
     lastEntryStopPts = 0.0;
     lastEntryBarTime = 0;
+    probeBarsSinceEntry = 0;
+    probeStopPts = 0.0;
+    equityGateLast = false;
 
     if(!LossStreak_Protection) return;
 
