@@ -1275,10 +1275,10 @@ double LotsFromRisk(double stop_points){
    if(lots < minLot) lots = minLot;
    if(lots > maxLot) lots = maxLot;
 
-   if(lotStep<=0.0) lotStep = 0.01;
+   if(lotStep<=0.0) lotStep = MathMax(0.01, minLot);
 
    // step align
-   lots = MathFloor(lots/lotStep)*lotStep;
+   lots = MathFloor((lots+1e-12)/lotStep)*lotStep;
    if(lots < minLot) lots = minLot;
    if(lots > maxLot) lots = maxLot;
    lots = NormalizeDouble(lots, (int)MathMin(8.0, MathMax(0.0, MathRound(-MathLog10(lotStep)))));
@@ -2085,7 +2085,22 @@ void OnTick(){
                   return true;
                }
             }
-            else { trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50); if(trade.Buy(lots,NULL,ask,sl,tp,"M15SwingLong")){ partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atr_points; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; } }
+            else {
+               trade.SetExpertMagicNumber(Magic);
+               trade.SetDeviationInPoints(50);
+               if(trade.Buy(lots,NULL,ask,sl,tp,"M15SwingLong")){
+                  partialTaken=false;
+                  secondPartialTaken=false;
+                  entryTime=TimeCurrent();
+                  entryStopPoints=stopPts;
+                  entryATRPoints=atr_points;
+                  signalHigh=m15[1].high;
+                  signalLow=m15[1].low;
+                  structureBreakOccurred=false;
+                  beMoved=false;
+                  return true;
+               }
+            }
          }
       }
    } else {
@@ -2142,7 +2157,22 @@ void OnTick(){
                   return true;
                }
             }
-            else { trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50); if(trade.Sell(lots,NULL,bid,sl,tp,"M15SwingShort")){ partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atr_points; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; } }
+            else {
+               trade.SetExpertMagicNumber(Magic);
+               trade.SetDeviationInPoints(50);
+               if(trade.Sell(lots,NULL,bid,sl,tp,"M15SwingShort")){
+                  partialTaken=false;
+                  secondPartialTaken=false;
+                  entryTime=TimeCurrent();
+                  entryStopPoints=stopPts;
+                  entryATRPoints=atr_points;
+                  signalHigh=m15[1].high;
+                  signalLow=m15[1].low;
+                  structureBreakOccurred=false;
+                  beMoved=false;
+                  return true;
+               }
+            }
          }
       }
    } else {
