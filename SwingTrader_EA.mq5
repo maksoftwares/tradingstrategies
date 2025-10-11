@@ -418,7 +418,7 @@ bool TryEnter(){
    double macd_curr, macd_prev, rsi_curr, rsi_prev;
    if(!GetValue(hMACD_M15,0,1,macd_curr) || !GetValue(hMACD_M15,0,2,macd_prev) || !GetValue(hRSI_M15,0,1,rsi_curr) || !GetValue(hRSI_M15,0,2,rsi_prev)) { AppendReason(why,"momData"); return LogAndReturnFalse(why); }
 
-   int stage = LoosenStage();
+   stage = LoosenStage();
    bool macdUp = (macd_prev<=0 && macd_curr>0);
    bool macdDown=(macd_prev>=0 && macd_curr<0);
    bool rsiUp = (rsi_prev<50 && rsi_curr>50);
