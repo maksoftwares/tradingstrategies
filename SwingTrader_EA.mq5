@@ -274,6 +274,11 @@ int    day_id  = -1;          // yyyyMMdd of last update
 int    week_id = -1;          // ISO week of year
 int    probe_trades_today = 0;
 double peak_equity = 0.0;
+double activeTradeRiskCash = 0.0;        // total monetary risk recorded at entry
+double activeTradeOneRCashPerLot = 0.0;  // 1R cash value per lot at entry
+double activeTradeInitialLots = 0.0;     // original position size (lots)
+double activeTradeRemainingLots = 0.0;   // lots still open for current trade
+ulong  activeTradePositionId = 0;        // position identifier to map closes
 
 // --- diagnostics counters ---
 ulong barsProcessed=0;
@@ -1424,23 +1429,52 @@ void RecordClosedTradeR(const ulong deal_id){
                  + HistoryDealGetDouble(deal_id, DEAL_SWAP)
                  + HistoryDealGetDouble(deal_id, DEAL_COMMISSION);
 
-   // Read stop points captured at entry; fall back to ATR if missing
-   double stop_pts = entryStopPoints;
-   if(stop_pts <= 0.0){
-      double atrLast=0.0; GetValue(hATR_M15,0,1,atrLast);
-      stop_pts = MathMax(1.0, atrLast/_Point);
+   ulong positionId = (ulong)HistoryDealGetInteger(deal_id, DEAL_POSITION_ID);
+   double riskCash = activeTradeRiskCash;
+   if(positionId != 0 && activeTradePositionId != 0 && positionId != activeTradePositionId)
+      riskCash = 0.0;
+
+   if(riskCash <= 0.0){
+      double stop_pts = entryStopPoints;
+      if(stop_pts <= 0.0) stop_pts = probeStopPts;
+      if(stop_pts <= 0.0){
+         double atrLast=0.0;
+         if(GetValue(hATR_M15,0,1,atrLast)) stop_pts = MathMax(1.0, atrLast/_Point);
+      }
+      double tick_value = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+      double tick_size  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+      double baseLots = (activeTradeInitialLots>0.0? activeTradeInitialLots : HistoryDealGetDouble(deal_id, DEAL_VOLUME));
+      double one_r_cash_per_lot = activeTradeOneRCashPerLot;
+      if(one_r_cash_per_lot <= 0.0 && stop_pts>0.0 && tick_value>0.0 && tick_size>0.0)
+         one_r_cash_per_lot = (stop_pts*_Point/MathMax(1e-10, tick_size)) * tick_value;
+      if(one_r_cash_per_lot>0.0 && baseLots>0.0)
+         riskCash = one_r_cash_per_lot * baseLots;
    }
 
-   // Tick value mapping to estimate 1R monetary risk per 1 lot
-   double tick_value = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
-   double tick_size  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
-   double one_r_cash_per_lot = (stop_pts*_Point/MathMax(1e-10, tick_size)) * tick_value;
-   double lot = HistoryDealGetDouble(deal_id, DEAL_VOLUME);
-   if(lot<=0.0 || one_r_cash_per_lot<=0.0) return;
-   double r_units = profit/(one_r_cash_per_lot*lot);
+   if(riskCash <= 0.0) return;
+
+   double r_units = (riskCash!=0.0 ? profit/riskCash : 0.0);
 
    R_today += r_units;
    R_week  += r_units;
+
+   if(positionId != 0 && positionId == activeTradePositionId){
+      double closedVol = HistoryDealGetDouble(deal_id, DEAL_VOLUME);
+      activeTradeRemainingLots = MathMax(0.0, activeTradeRemainingLots - closedVol);
+      if(activeTradeRemainingLots <= 0.0 || !PositionSelect(_Symbol)){
+         activeTradeRiskCash = 0.0;
+         activeTradeOneRCashPerLot = 0.0;
+         activeTradeInitialLots = 0.0;
+         activeTradeRemainingLots = 0.0;
+         activeTradePositionId = 0;
+      }
+   } else if(!PositionSelect(_Symbol)){
+      activeTradeRiskCash = 0.0;
+      activeTradeOneRCashPerLot = 0.0;
+      activeTradeInitialLots = 0.0;
+      activeTradeRemainingLots = 0.0;
+      activeTradePositionId = 0;
+   }
 }
 
 bool CapsAllowTrading(bool &probe_mode_out){
@@ -1866,6 +1900,46 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
    long entryType = HistoryDealGetInteger(dealId, DEAL_ENTRY);
 
    if(entryType == DEAL_ENTRY_IN){
+      double volume = HistoryDealGetDouble(dealId, DEAL_VOLUME);
+      double stopPts = entryStopPoints;
+      if(stopPts <= 0.0) stopPts = probeStopPts;
+      if(stopPts <= 0.0){
+         double atrLast=0.0;
+         if(GetValue(hATR_M15,0,1,atrLast)) stopPts = MathMax(1.0, atrLast/_Point);
+      }
+      double tick_value = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+      double tick_size  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+      double oneRCashPerLot = 0.0;
+      if(stopPts > 0.0 && tick_value>0.0 && tick_size>0.0)
+         oneRCashPerLot = (stopPts*_Point/MathMax(1e-10, tick_size)) * tick_value;
+      activeTradeOneRCashPerLot = oneRCashPerLot;
+      activeTradeInitialLots = volume;
+      activeTradeRemainingLots = volume;
+      activeTradeRiskCash = oneRCashPerLot * volume;
+      activeTradePositionId = (ulong)HistoryDealGetInteger(dealId, DEAL_POSITION_ID);
+      if(activeTradeRiskCash <= 0.0){
+         double fallbackStopPts = stopPts;
+         if(PositionSelect(_Symbol) && (ulong)PositionGetInteger(POSITION_MAGIC)==Magic){
+            double posPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            double posSL    = PositionGetDouble(POSITION_SL);
+            double posVol   = PositionGetDouble(POSITION_VOLUME);
+            if(posVol > 0.0){
+               volume = posVol;
+               activeTradeInitialLots = volume;
+               activeTradeRemainingLots = volume;
+            }
+            if(posSL > 0.0 && posPrice>0.0)
+               fallbackStopPts = MathMax(fallbackStopPts, MathAbs(posPrice-posSL)/_Point);
+         }
+         double atrFallback=0.0;
+         if(fallbackStopPts <= 0.0 && GetValue(hATR_M15,0,1,atrFallback))
+            fallbackStopPts = MathMax(1.0, atrFallback/_Point);
+         if(fallbackStopPts>0.0 && tick_value>0.0 && tick_size>0.0){
+            double fallbackOneR = (fallbackStopPts*_Point/MathMax(1e-10, tick_size)) * tick_value;
+            activeTradeOneRCashPerLot = fallbackOneR;
+            activeTradeRiskCash = fallbackOneR * MathMax(volume, SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN));
+         }
+      }
       TradesToday++;
       barsSinceEntry = 0;
       lastEntryStopPts = entryStopPoints;
