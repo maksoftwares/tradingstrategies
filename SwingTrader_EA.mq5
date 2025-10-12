@@ -9,6 +9,10 @@
 
 #include <Trade/Trade.mqh>
 
+inline bool IsFiniteD(const double x){
+   return (x==x) && (x!=INFINITY) && (x!=-INFINITY);
+}
+
 // --- Realized-R accounting and stall guards ---
 double  gR_day=0.0, gR_week=0.0;
 int     gDayId=-1, gWeekId=-1;
@@ -60,7 +64,7 @@ input int      MACD_Slow       = 26;
 input int      MACD_Signal     = 9;
 
 input group "=== Risk & Money Management ==="
-input double   Risk_Percent    = 0.60;     // % of balance per trade
+input double   Risk_Percent    = 0.75;     // % of balance per trade
 input double   MaxRiskLotsCap  = 0.10;     // hard cap per trade
 input double   MinStop_ATR     = 1.0;      // ensure SL distance >= 1×ATR
 input double   MinStop_Points  = 50.0;     // absolute floor in points
@@ -68,11 +72,11 @@ input int      ATR_Period      = 14;
 input double   ATR_SL_mult     = 2.5;      // SL = max(ATR*mult, swing buffer)
 input double   Swing_Buffer_ATR= 0.20;     // extra beyond fractal (as ATR multiple)
 input double   TP1_R           = 1.00;     // first partial (tighter for faster risk reduction)
-input double   TP2_R           = 2.20;     // second partial / scale-out point
+input double   TP2_R           = 2.10;     // second partial / scale-out point
 input double   TP3_R           = 3.50;     // runner target
 input bool     Use_TP3         = true;     // enable third target
-input double   TP1_Close_Pct   = 0.40;     // portion to close at TP1
-input double   TP2_Close_Pct   = 0.35;     // portion to close at TP2 (rest trails / TP3)
+input double   TP1_Close_Pct   = 0.50;     // portion to close at TP1
+input double   TP2_Close_Pct   = 0.30;     // portion to close at TP2 (rest trails / TP3)
 input bool     Adaptive_R_Targets = true;  // adjust TP2/TP3 with volatility regime
 input int      ATR_Regime_Period  = 50;    // ATR SMA period for regime calc
 input double   HighVolRatio       = 1.30;  // ATR / ATR_SMA > this => high vol (stretch targets)
@@ -82,16 +86,16 @@ input double   ATR_Regime_Min_Ratio = 0.75; // skip entries if ATR/ATR_SMA below
 input double   HighVol_Target_Boost = 0.6; // add to TP2/TP3 R
 input double   LowVol_Target_Reduction = 0.25; // subtract from TP2/TP3 R
 input bool     Use_Trailing    = true;     // chandelier trail after BE
-input double   Trail_ATR_mult  = 2.5;      // base trail
-input double   Trail_Tight_ATR_mult = 1.8; // tighter trail beyond trigger R
+input double   Trail_ATR_mult  = 3.0;      // base trail
+input double   Trail_Tight_ATR_mult = 2.4; // tighter trail beyond trigger R
 input double   Trail_Tighten_Trigger_R = 2.0; // tighten trail after this R
 input bool     Use_Time_Exit   = true;     // exit stale trades
-input int      Max_Bars_In_Trade = 144;    // close if trade exceeds this many M15 bars (~36h)
+input int      Max_Bars_In_Trade = 96;     // close if trade exceeds this many M15 bars (~24h)
 input bool     Use_Vol_Compress_Exit = true; // exit if volatility collapses
 input double   Vol_Compress_Ratio = 0.65;  // ATR(now)/ATR(entry) below => exit if not reached 0.5R
 
 input group "=== Risk Caps & Probes ==="
-input bool   Enable_RiskCaps          = true;    // enable budget caps
+input bool   Enable_RiskCaps          = false;   // enable budget caps
 input double Risk_Percent_Base        = 0.35;    // base % risk per trade (0.35%)
 input double DailyLossCap_R           = 1.8;     // stop trading for the day if net closed loss <= -1.8R
 input double WeeklyLossCap_R          = 4.0;     // stop trading for the week if net closed loss <= -4R
@@ -115,7 +119,7 @@ input int      MaxSpreadPoints = 200;      // reject entries if spread too wide
 input ulong    Magic           = 20251011; // EA magic
 
 input group "=== Advanced Filters & Sessions ==="
-input bool     RequireBothMomentum    = true;  // require both MACD & RSI (false = either)
+input bool     RequireBothMomentum    = false; // require both MACD & RSI (false = either)
 input double   Min_ATR_Filter         = 6.0;    // Minimum ATR (points) to allow trades
 input double   Max_Close_Extension_ATR= 0.9;    // Reject if close is > this * ATR above/below pullback EMA
 input bool     Use_Session_Filter     = false;  // Restrict trading to session hours
@@ -134,43 +138,43 @@ input group "=== Trend & Strength Filters ==="
 // Trend & Strength Filters
 input bool     Use_ADX_Filter         = true;
 input int      ADX_Period             = 14;
-input double   Min_ADX                = 15.0;  // minimum ADX strength requirement
+input double   Min_ADX                = 17.0;  // minimum ADX strength requirement
 input bool     Use_EMA200_Slope       = true;
-input int      EMA200_Slope_Lookback  = 10;
-input double   Min_EMA200_Slope_Pts   = 6.0;   // minimum EMA200 slope in points
+input int      EMA200_Slope_Lookback  = 8;
+input double   Min_EMA200_Slope_Pts   = 12.0;  // minimum EMA200 slope in points
 input int      SlopeLookback          = 8;       // permissive slope lookback (new flow)
 input double   MinSlopePts            = 8;       // permissive minimum slope points (new flow)
 
 input group "=== Momentum Quality Thresholds ==="
-input double   RSI_Min_Long           = 51.0;   // require RSI above this for longs
-input double   RSI_Max_Short          = 49.0;   // require RSI below this for shorts
-input double   MACD_Min_Abs           = 0.06;   // min absolute MACD main beyond zero
+input double   RSI_Min_Long           = 51.5;   // require RSI above this for longs
+input double   RSI_Max_Short          = 48.5;   // require RSI below this for shorts
+input double   MACD_Min_Abs           = 0.07;   // min absolute MACD main beyond zero
 
 input group "=== Pullback / Structure Quality ==="
 input double   Min_Pull_Depth_ATR     = 0.10;   // minimum pullback depth as ATR fraction
 input double   Structure_Buffer_ATR   = 0.05;   // close must clear structure EMA by this ATR
 input bool     Use_Structure_Space    = true;   // Minimum space filter to next structure
-input double   MinSpace_ATR           = 0.60;    // minimum ATR headroom
-input int      Space_Lookback_Bars    = 80;     // lookback bars to compute highest/lowest structure
+input double   MinSpace_ATR           = 0.30;    // minimum ATR headroom
+input int      Space_Lookback_Bars    = 60;     // lookback bars to compute highest/lowest structure
 input int      SR_Lookback            = 20;     // swing high/low lookback for new flow
 
 input group "=== Confirmation Entry (Stop Orders) ==="
 input bool     Use_Stop_Confirmation  = true;   // Use pending stop orders for confirmation
 input int      EntryBufferPts         = 14;     // buffer (points) beyond signal candle extreme
-input int      PendingOrder_Expiry_Bars = 8;    // cancel pending after N bars
+input int      PendingOrder_Expiry_Bars = 4;    // cancel pending after N bars
 input bool     UseStopOrders          = true;   // New flow toggle (market vs stop)
 input double   EntryBufferPts_New     = 14;     // New flow entry buffer
 
 input group "=== Break-Even Logic ==="
 input bool     MoveBE_On_StructureBreak = true; // Move to BE only after structure break
-input double   BE_Fallback_R          = 1.00;   // fallback R to force BE if no break
+input double   BE_Fallback_R          = 1.10;   // fallback R to force BE if no break
 input int      Break_Buffer_Points    = 10;     // extra points above/below signal high/low to count break
 
 input group "=== Dynamic Spread & Sessions ==="
 input bool     Dynamic_Spread_Cap     = true;   // dynamic spread cap using ATR
-input double   Spread_ATR_Fraction    = 0.40;   // allowed spread = % of ATR (points)
-input int      HardSpreadCapPts       = 1200;   // absolute safety ceiling
-input bool     Stage2_IgnoresSpread   = false;  // bypass spread check at stage 2 when no trades yet
+input double   Spread_ATR_Fraction    = 0.30;   // allowed spread = % of ATR (points)
+input int      HardSpreadCapPts       = 600;    // absolute safety ceiling
+input bool     Stage2_IgnoresSpread   = true;   // bypass spread check at stage 2 when no trades yet
 input bool     Enhanced_Session_Filter= false;  // refined session rules (DISABLED for 24h trading)
 input int      LondonNY_Start_Hour    = 6;      // Session start (0=all day)
 input int      LondonNY_End_Hour      = 20;     // Session end (24=all day)
@@ -178,19 +182,19 @@ input bool     Skip_Monday_Asian      = true;   // DISABLED for more opportuniti
 input int      Monday_Skip_Until_Hour = 3;
 input bool     Skip_Friday_Late       = true;   // DISABLED for more opportunities
 input int      Friday_Cutoff_Hour     = 19;
-input bool     Stage2_OverrideSession = true;   // Allow entries at stage 2 regardless of session
+input bool     Stage2_OverrideSession = false;  // Allow entries at stage 2 regardless of session
 
 input group "=== Loss Streak & Side Control ==="
 input bool     LossStreak_Protection  = true;   // pause after loss streak
-input int      Max_Loss_Streak        = 2;
-input int      Loss_Cooldown_Bars     = 6;      // bars to pause after hitting loss streak
+input int      Max_Loss_Streak        = 3;
+input int      Loss_Cooldown_Bars     = 4;      // bars to pause after hitting loss streak
 input int      MinBarsForSignals      = 50;    // minimum bars required before allowing signals
 // (Adjusted later: default will be reduced to 3 in adaptive frequency changes)
 input bool     AllowLongs             = true;   // enable/disable long side
 input bool     AllowShorts            = true;   // enable/disable short side
 input bool     Use_New_Entry_Flow     = true;   // Activate simplified lenient/quality TryEnter() flow
 input int      CI_Max                 = 60;     // Placeholder compression index max (not yet implemented)
-input int      MaxSpreadPoints_New    = 180;    // New flow max spread hard cap
+input int      MaxSpreadPoints_New    = 160;    // New flow max spread hard cap
 input double   MaxSpread_ATR_Frac     = 0.18;   // New flow dynamic spread fraction
 
 input bool   Cooldown_Stage0_Only = true;     // apply cooldown only at stage 0
@@ -211,15 +215,15 @@ input bool   AdaptiveLoosen     = true;  // enable dynamic threshold loosening i
 input int    DailyMinTrades     = 1;     // target minimum trades per day
 input int    LoosenHour1        = 12;    // first relax hour (server time)
 input int    LoosenHour2        = 16;    // second relax hour
-input int    ADX_Min_L0         = 15;    // base strict
-input int    ADX_Min_L1         = 14;    // first relax
-input int    ADX_Min_L2         = 13;    // second relax
+input int    ADX_Min_L0         = 18;    // base strict
+input int    ADX_Min_L1         = 16;    // first relax
+input int    ADX_Min_L2         = 14;    // second relax
 input double CI_Max_L0          = 50.0;  // compression index max stage 0
 input double CI_Max_L1          = 60.0;  // compression index max stage 1
 input double CI_Max_L2          = 70.0;  // compression index max stage 2
-input double MinSpace_ATR_L0    = 0.60;   // structure space stage 0
-input double MinSpace_ATR_L1    = 0.45;   // structure space stage 1
-input double MinSpace_ATR_L2    = 0.25;   // structure space stage 2
+input double MinSpace_ATR_L0    = 0.30;   // structure space stage 0
+input double MinSpace_ATR_L1    = 0.25;   // structure space stage 1
+input double MinSpace_ATR_L2    = 0.15;   // structure space stage 2
 input int    RSI_Mid_L2         = 49;    // slightly easier RSI midline at stage 2
 
 input group "=== Equity Gate & Probe Lane ==="
@@ -246,8 +250,8 @@ input double   Quota_Min_ATR_Points     = 350.0;  // min ATR(points) to avoid de
 input double   Quota_MaxSpread_ATR_Frac = 0.30;   // spread must be <= this * ATR(points)
 
 input group "=== Safety & Quota Guards ==="
-input double   DailyRiskMaxPct          = 3.0;    // Max % of BALANCE allowed to lose in a single day; block new entries when exceeded.
-input double   WeeklyRiskMaxPct         = 6.0;    // Max % of BALANCE allowed to lose in rolling 5 trading days.
+input double   DailyRiskMaxPct          = 10.0;   // Max % of BALANCE allowed to lose in a single day; block new entries when exceeded.
+input double   WeeklyRiskMaxPct         = 25.0;   // Max % of BALANCE allowed to lose in rolling 5 trading days.
 input int      MaxConsecLosses_Day      = 3;      // If we hit this many losses in a single day, pause further entries until next session.
 input double   Quota_ADX_Min            = 18.0;   // Minimum ADX on M15 for quota trade.
 input double   Quota_H1EMA_Separation_MinPts = 20.0; // Minimum separation between H1 fast/slow EMA in POINTS to allow quota.
@@ -928,14 +932,6 @@ bool TryEnter(){
 
    // Hard unlocks/guards: never perma-lock due to risk caps
    ResetDailyCounters();
-   if(!RiskGate_Enable){
-      // skip cap checks entirely
-   } else {
-      if(TradesToday>0 && ((gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week))){
-         DiagnosticsCount("riskGate");
-         return LogAndReturnFalse("budget-gate");
-      }
-   }
 
    if(LossStreak_Protection && cooldownBarsRemaining>0)
       return LogAndReturnFalse("cooldown");
@@ -980,6 +976,14 @@ bool TryEnter(){
    
    if(!SessionAllowed()) { AppendReason(why,"session"); return LogAndReturnFalse(why); }
    if(HasOpenPosition()) { AppendReason(why,"openPos"); return LogAndReturnFalse(why); }
+
+   if(RiskGate_Enable){
+      if(TradesToday>0 && ((gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week))){
+         if(Enable_Diagnostics) PrintFormat("[Gate] Risk gate block: R_today=%.2f R_week=%.2f", gR_day, gR_week);
+         DiagnosticsCount("riskGate");
+         return LogAndReturnFalse("budget-gate");
+      }
+   }
 
    double emaPull_1, emaStruct_1, emaFastH1, emaSlowH1;
    if(!GetValue(hEMA_M15_pull,0,1,emaPull_1) || !GetValue(hEMA_M15_struct,0,1,emaStruct_1) || !GetValue(hEMA_H1_fast,0,1,emaFastH1) || !GetValue(hEMA_H1_slow,0,1,emaSlowH1)) { AppendReason(why,"ema"); return LogAndReturnFalse(why); }
@@ -2170,7 +2174,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
    if(riskMoney<=0.0)
       riskMoney = MathMax(0.01, AccountInfoDouble(ACCOUNT_BALANCE)*(Risk_Percent/100.0));
    double r = (riskMoney>0.0 ? profit / riskMoney : 0.0);
-   if(MathIsValidNumber(r)){
+   if(IsFiniteD(r)){
       gR_day += r;
       gR_week += r;
       R_today = gR_day;
