@@ -9,10 +9,16 @@
 
 #include <Trade/Trade.mqh>
 
+inline bool IsFiniteD(const double x)
+{
+   return MathIsValidNumber(x);
+}
+
 // --- Realized-R accounting and stall guards ---
 double  gR_day=0.0, gR_week=0.0;
 int     gDayId=-1, gWeekId=-1;
 datetime gLastTradeTime=0;
+double  dayStartEquity=0.0, weekStartEquity=0.0;
 // tiny map for entry risk capture
 ulong gOpenTicket[16]; double gOpenRiskMoney[16]; int gOpenCount=0;
 void RiskMapPut(ulong t,double m){ for(int i=0;i<gOpenCount;i++) if(gOpenTicket[i]==t){ gOpenRiskMoney[i]=m; return; } if(gOpenCount<16){ gOpenTicket[gOpenCount]=t; gOpenRiskMoney[gOpenCount]=m; gOpenCount++; } }
@@ -68,11 +74,11 @@ input int      ATR_Period      = 14;
 input double   ATR_SL_mult     = 2.5;      // SL = max(ATR*mult, swing buffer)
 input double   Swing_Buffer_ATR= 0.20;     // extra beyond fractal (as ATR multiple)
 input double   TP1_R           = 1.00;     // first partial (tighter for faster risk reduction)
-input double   TP2_R           = 2.20;     // second partial / scale-out point
+input double   TP2_R           = 2.10;     // second partial / scale-out point
 input double   TP3_R           = 3.50;     // runner target
 input bool     Use_TP3         = true;     // enable third target
-input double   TP1_Close_Pct   = 0.40;     // portion to close at TP1
-input double   TP2_Close_Pct   = 0.35;     // portion to close at TP2 (rest trails / TP3)
+input double   TP1_Close_Pct   = 0.50;     // portion to close at TP1
+input double   TP2_Close_Pct   = 0.30;     // portion to close at TP2 (rest trails / TP3)
 input bool     Adaptive_R_Targets = true;  // adjust TP2/TP3 with volatility regime
 input int      ATR_Regime_Period  = 50;    // ATR SMA period for regime calc
 input double   HighVolRatio       = 1.30;  // ATR / ATR_SMA > this => high vol (stretch targets)
@@ -82,16 +88,16 @@ input double   ATR_Regime_Min_Ratio = 0.75; // skip entries if ATR/ATR_SMA below
 input double   HighVol_Target_Boost = 0.6; // add to TP2/TP3 R
 input double   LowVol_Target_Reduction = 0.25; // subtract from TP2/TP3 R
 input bool     Use_Trailing    = true;     // chandelier trail after BE
-input double   Trail_ATR_mult  = 2.5;      // base trail
-input double   Trail_Tight_ATR_mult = 1.8; // tighter trail beyond trigger R
+input double   Trail_ATR_mult  = 3.0;      // base trail
+input double   Trail_Tight_ATR_mult = 2.4; // tighter trail beyond trigger R
 input double   Trail_Tighten_Trigger_R = 2.0; // tighten trail after this R
 input bool     Use_Time_Exit   = true;     // exit stale trades
-input int      Max_Bars_In_Trade = 144;    // close if trade exceeds this many M15 bars (~36h)
+input int      Max_Bars_In_Trade = 96;     // close if trade exceeds this many M15 bars (~24h)
 input bool     Use_Vol_Compress_Exit = true; // exit if volatility collapses
 input double   Vol_Compress_Ratio = 0.65;  // ATR(now)/ATR(entry) below => exit if not reached 0.5R
 
 input group "=== Risk Caps & Probes ==="
-input bool   Enable_RiskCaps          = true;    // enable budget caps
+input bool   Enable_RiskCaps          = false;   // enable budget caps
 input double Risk_Percent_Base        = 0.35;    // base % risk per trade (0.35%)
 input double DailyLossCap_R           = 1.8;     // stop trading for the day if net closed loss <= -1.8R
 input double WeeklyLossCap_R          = 4.0;     // stop trading for the week if net closed loss <= -4R
@@ -102,12 +108,25 @@ input double Probe_TP_R               = 1.0;     // TP for probes
 input double Risk_Throttle_DD_Pct     = 20.0;    // when equity drawdown from peak exceeds this %, throttle risk
 input double Risk_Throttle_Pct        = 0.15;    // throttled risk % while in deep DD
 
+input group "=== Drawdown Recovery Gates ==="
+input bool     DailyDD_Enable         = true;
+input double   DailyDD_MaxPct         = 18.0;
+input bool     WeeklyDD_Enable        = true;
+input double   WeeklyDD_MaxPct        = 35.0;
+input int      DD_IdleUnlockBars      = 64;
+
+input group "=== Day Loss Cap ==="
+input bool   DayLossCap_Enable         = true;
+input int    DayLossCap_MaxLosses      = 3;
+input double DayLossCap_MinR           = -3.0;
+input int    DayLossCap_LockBars       = 32;  // ~8h on M15
+input int    DayLossCap_IdleUnlockBars = 64;
+
 // --- Weekly equity cap (prevents overtrading after drawdown weeks)
 input bool   Use_Weekly_Risk_Cap   = false;
 input bool   Use_Daily_Risk_Cap    = false;
 input double WeeklyRiskCapPct      = 30.0;  // raised threshold
 input double DailyRiskCapPct       = 15.0;  // daily cap when enabled
-double weekStartEquity = 0.0;
 int    lastWeekId = -1;
 
 input group "=== Trade Hygiene ==="
@@ -115,7 +134,7 @@ input int      MaxSpreadPoints = 200;      // reject entries if spread too wide
 input ulong    Magic           = 20251011; // EA magic
 
 input group "=== Advanced Filters & Sessions ==="
-input bool     RequireBothMomentum    = true;  // require both MACD & RSI (false = either)
+input bool     RequireBothMomentum    = false; // require both MACD & RSI (false = either)
 input double   Min_ATR_Filter         = 6.0;    // Minimum ATR (points) to allow trades
 input double   Max_Close_Extension_ATR= 0.9;    // Reject if close is > this * ATR above/below pullback EMA
 input bool     Use_Session_Filter     = false;  // Restrict trading to session hours
@@ -134,43 +153,43 @@ input group "=== Trend & Strength Filters ==="
 // Trend & Strength Filters
 input bool     Use_ADX_Filter         = true;
 input int      ADX_Period             = 14;
-input double   Min_ADX                = 15.0;  // minimum ADX strength requirement
+input double   Min_ADX                = 17.0;  // minimum ADX strength requirement
 input bool     Use_EMA200_Slope       = true;
-input int      EMA200_Slope_Lookback  = 10;
-input double   Min_EMA200_Slope_Pts   = 6.0;   // minimum EMA200 slope in points
+input int      EMA200_Slope_Lookback  = 8;
+input double   Min_EMA200_Slope_Pts   = 12.0;  // minimum EMA200 slope in points
 input int      SlopeLookback          = 8;       // permissive slope lookback (new flow)
 input double   MinSlopePts            = 8;       // permissive minimum slope points (new flow)
 
 input group "=== Momentum Quality Thresholds ==="
-input double   RSI_Min_Long           = 51.0;   // require RSI above this for longs
-input double   RSI_Max_Short          = 49.0;   // require RSI below this for shorts
-input double   MACD_Min_Abs           = 0.06;   // min absolute MACD main beyond zero
+input double   RSI_Min_Long           = 51.5;   // require RSI above this for longs
+input double   RSI_Max_Short          = 48.5;   // require RSI below this for shorts
+input double   MACD_Min_Abs           = 0.07;   // min absolute MACD main beyond zero
 
 input group "=== Pullback / Structure Quality ==="
 input double   Min_Pull_Depth_ATR     = 0.10;   // minimum pullback depth as ATR fraction
 input double   Structure_Buffer_ATR   = 0.05;   // close must clear structure EMA by this ATR
 input bool     Use_Structure_Space    = true;   // Minimum space filter to next structure
-input double   MinSpace_ATR           = 0.60;    // minimum ATR headroom
-input int      Space_Lookback_Bars    = 80;     // lookback bars to compute highest/lowest structure
+input double   MinSpace_ATR           = 0.30;    // minimum ATR headroom
+input int      Space_Lookback_Bars    = 60;     // lookback bars to compute highest/lowest structure
 input int      SR_Lookback            = 20;     // swing high/low lookback for new flow
 
 input group "=== Confirmation Entry (Stop Orders) ==="
 input bool     Use_Stop_Confirmation  = true;   // Use pending stop orders for confirmation
 input int      EntryBufferPts         = 14;     // buffer (points) beyond signal candle extreme
-input int      PendingOrder_Expiry_Bars = 8;    // cancel pending after N bars
+input int      PendingOrder_Expiry_Bars = 4;    // cancel pending after N bars
 input bool     UseStopOrders          = true;   // New flow toggle (market vs stop)
 input double   EntryBufferPts_New     = 14;     // New flow entry buffer
 
 input group "=== Break-Even Logic ==="
 input bool     MoveBE_On_StructureBreak = true; // Move to BE only after structure break
-input double   BE_Fallback_R          = 1.00;   // fallback R to force BE if no break
+input double   BE_Fallback_R          = 1.10;   // fallback R to force BE if no break
 input int      Break_Buffer_Points    = 10;     // extra points above/below signal high/low to count break
 
 input group "=== Dynamic Spread & Sessions ==="
 input bool     Dynamic_Spread_Cap     = true;   // dynamic spread cap using ATR
-input double   Spread_ATR_Fraction    = 0.40;   // allowed spread = % of ATR (points)
-input int      HardSpreadCapPts       = 1200;   // absolute safety ceiling
-input bool     Stage2_IgnoresSpread   = false;  // bypass spread check at stage 2 when no trades yet
+input double   Spread_ATR_Fraction    = 0.30;   // allowed spread = % of ATR (points)
+input int      HardSpreadCapPts       = 600;    // absolute safety ceiling
+input bool     Stage2_IgnoresSpread   = true;   // bypass spread check at stage 2 when no trades yet
 input bool     Enhanced_Session_Filter= false;  // refined session rules (DISABLED for 24h trading)
 input int      LondonNY_Start_Hour    = 6;      // Session start (0=all day)
 input int      LondonNY_End_Hour      = 20;     // Session end (24=all day)
@@ -178,7 +197,7 @@ input bool     Skip_Monday_Asian      = true;   // DISABLED for more opportuniti
 input int      Monday_Skip_Until_Hour = 3;
 input bool     Skip_Friday_Late       = true;   // DISABLED for more opportunities
 input int      Friday_Cutoff_Hour     = 19;
-input bool     Stage2_OverrideSession = true;   // Allow entries at stage 2 regardless of session
+input bool     Stage2_OverrideSession = false;  // Allow entries at stage 2 regardless of session
 
 input group "=== Loss Streak & Side Control ==="
 input bool     LossStreak_Protection  = true;   // pause after loss streak
@@ -190,7 +209,7 @@ input bool     AllowLongs             = true;   // enable/disable long side
 input bool     AllowShorts            = true;   // enable/disable short side
 input bool     Use_New_Entry_Flow     = true;   // Activate simplified lenient/quality TryEnter() flow
 input int      CI_Max                 = 60;     // Placeholder compression index max (not yet implemented)
-input int      MaxSpreadPoints_New    = 180;    // New flow max spread hard cap
+input int      MaxSpreadPoints_New    = 160;    // New flow max spread hard cap
 input double   MaxSpread_ATR_Frac     = 0.18;   // New flow dynamic spread fraction
 
 input bool   Cooldown_Stage0_Only = true;     // apply cooldown only at stage 0
@@ -211,15 +230,15 @@ input bool   AdaptiveLoosen     = true;  // enable dynamic threshold loosening i
 input int    DailyMinTrades     = 1;     // target minimum trades per day
 input int    LoosenHour1        = 12;    // first relax hour (server time)
 input int    LoosenHour2        = 16;    // second relax hour
-input int    ADX_Min_L0         = 15;    // base strict
-input int    ADX_Min_L1         = 14;    // first relax
-input int    ADX_Min_L2         = 13;    // second relax
+input int    ADX_Min_L0         = 18;    // base strict
+input int    ADX_Min_L1         = 16;    // first relax
+input int    ADX_Min_L2         = 14;    // second relax
 input double CI_Max_L0          = 50.0;  // compression index max stage 0
 input double CI_Max_L1          = 60.0;  // compression index max stage 1
 input double CI_Max_L2          = 70.0;  // compression index max stage 2
-input double MinSpace_ATR_L0    = 0.60;   // structure space stage 0
-input double MinSpace_ATR_L1    = 0.45;   // structure space stage 1
-input double MinSpace_ATR_L2    = 0.25;   // structure space stage 2
+input double MinSpace_ATR_L0    = 0.30;   // structure space stage 0
+input double MinSpace_ATR_L1    = 0.25;   // structure space stage 1
+input double MinSpace_ATR_L2    = 0.15;   // structure space stage 2
 input int    RSI_Mid_L2         = 49;    // slightly easier RSI midline at stage 2
 
 input group "=== Equity Gate & Probe Lane ==="
@@ -246,8 +265,8 @@ input double   Quota_Min_ATR_Points     = 350.0;  // min ATR(points) to avoid de
 input double   Quota_MaxSpread_ATR_Frac = 0.30;   // spread must be <= this * ATR(points)
 
 input group "=== Safety & Quota Guards ==="
-input double   DailyRiskMaxPct          = 3.0;    // Max % of BALANCE allowed to lose in a single day; block new entries when exceeded.
-input double   WeeklyRiskMaxPct         = 6.0;    // Max % of BALANCE allowed to lose in rolling 5 trading days.
+input double   DailyRiskMaxPct          = 10.0;   // Max % of BALANCE allowed to lose in a single day; block new entries when exceeded.
+input double   WeeklyRiskMaxPct         = 25.0;   // Max % of BALANCE allowed to lose in rolling 5 trading days.
 input int      MaxConsecLosses_Day      = 3;      // If we hit this many losses in a single day, pause further entries until next session.
 input double   Quota_ADX_Min            = 18.0;   // Minimum ADX on M15 for quota trade.
 input double   Quota_H1EMA_Separation_MinPts = 20.0; // Minimum separation between H1 fast/slow EMA in POINTS to allow quota.
@@ -342,7 +361,7 @@ ulong rej_trend=0, rej_pullback=0, rej_structure=0, rej_momentum=0, rej_candle=0
 ulong rej_misc=0, rej_riskGate=0;
 
 // additional rejection counters
-ulong rej_space=0, rej_cooldown=0, rej_spreadDynamic=0, rej_side=0, rej_slope=0;
+ulong rej_space=0, rej_cooldown=0, rej_spreadDynamic=0, rej_side=0, rej_slope=0, rej_dayLossCap=0, rej_equityDD=0;
 
 // confirmation entry & structure break
 ulong    pendingTicket  = 0;
@@ -409,6 +428,8 @@ void DiagnosticsPrintSummary(){
          " Space=",rej_space,
          " Cooldown=",rej_cooldown,
          " DynSpread=",rej_spreadDynamic,
+         " DayLossCap=",rej_dayLossCap,
+         " EquityDD=",rej_equityDD,
          " Side=",rej_side,
          " Slope=",rej_slope,
          " RiskGate=",rej_riskGate);
@@ -430,11 +451,13 @@ void DiagnosticsCount(const string tag){
    else if(tag=="candle") rej_candle++;
    else if(tag=="extension") rej_extension++;
    else if(tag=="riskGate") rej_riskGate++;
-      else if(tag=="space") rej_space++;
-      else if(tag=="cooldown") rej_cooldown++;
-      else if(tag=="dynSpread") rej_spreadDynamic++;
-      else if(tag=="side") rej_side++;
-      else if(tag=="slope") rej_slope++;
+   else if(tag=="space") rej_space++;
+   else if(tag=="cooldown") rej_cooldown++;
+   else if(tag=="dynSpread") rej_spreadDynamic++;
+   else if(tag=="day-loss-cap") rej_dayLossCap++;
+   else if(tag=="equity-dd-cap") rej_equityDD++;
+   else if(tag=="side") rej_side++;
+   else if(tag=="slope") rej_slope++;
    else rej_misc++;
 }
 
@@ -647,8 +670,162 @@ void DayWeekIds(const datetime t, int &d_out, int &w_out){
 void ResetDailyCounters(){
    int dId, wId;
    DayWeekIds(TimeCurrent(), dId, wId);
-   if(gDayId!=dId){ gDayId=dId; gR_day=0.0; TradesToday=0; cooldownBarsRemaining=0; }
-   if(gWeekId!=wId){ gWeekId=wId; gR_week=0.0; }
+
+   // Day reset
+   if(gDayId!=dId){
+      gDayId=dId;
+      gR_day=0.0;
+      TradesToday=0;
+      dayLossCount=0;
+      consecutiveLosses=0;
+      cooldownBarsRemaining=0;
+      dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      R_today = 0.0;
+   }
+
+   // Week reset
+   if(gWeekId!=wId){
+      gWeekId=wId;
+      gR_week=0.0;
+      weekStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      R_week = 0.0;
+   }
+}
+
+bool DayLossCapBlocks(){
+   if(!DayLossCap_Enable) return false;
+   static int lockBars=0;
+   static bool grace=false;
+   static datetime graceStamp=0;
+
+   bool hit = (dayLossCount >= DayLossCap_MaxLosses) || (gR_day <= DayLossCap_MinR);
+   int idleBars = (gLastTradeTime>0)? int((TimeCurrent()-gLastTradeTime)/PeriodSeconds(PERIOD_M15)) : 9999;
+
+   if(grace){
+      if(gLastTradeTime>graceStamp){
+         grace=false;
+      } else {
+         return false;
+      }
+   }
+
+   if(hit){
+      if(lockBars==0 && Enable_Diagnostics)
+         PrintFormat("[Gate] Day loss cap hit: losses=%d R_day=%.2f threshold=%.2f", dayLossCount, gR_day, DayLossCap_MinR);
+      if(lockBars < DayLossCap_LockBars){ lockBars++; return true; }
+      if(idleBars >= DayLossCap_IdleUnlockBars){
+         if(Enable_Diagnostics) Print("[Gate] Day loss cap idle unlock");
+         lockBars=0;
+         grace=true;
+         graceStamp=TimeCurrent();
+         dayLossCount=0;
+         return false;
+      }
+      return true;
+   }
+   lockBars=0;
+   grace=false;
+   return false;
+}
+
+bool EquityDD_Gate(){
+   if(!DailyDD_Enable && !WeeklyDD_Enable) return false;
+   int idleBars = (gLastTradeTime>0)? int((TimeCurrent()-gLastTradeTime)/PeriodSeconds(PERIOD_M15)) : 9999;
+   static bool dayBlocking=false;
+   static bool weekBlocking=false;
+   static bool dailyGrace=false;
+   static datetime dailyGraceStamp=0;
+   static bool weeklyGrace=false;
+   static datetime weeklyGraceStamp=0;
+
+   bool blocked=false;
+
+   if(dailyGrace && gLastTradeTime>dailyGraceStamp) dailyGrace=false;
+   if(weeklyGrace && gLastTradeTime>weeklyGraceStamp) weeklyGrace=false;
+
+   if(DailyDD_Enable && dayStartEquity>0.0){
+      double dd = 100.0*(dayStartEquity-AccountInfoDouble(ACCOUNT_EQUITY))/dayStartEquity;
+      if(dd > DailyDD_MaxPct){
+         if(dailyGrace){
+            dayBlocking=false;
+         } else {
+            if(!dayBlocking && Enable_Diagnostics)
+               PrintFormat("[Gate] Daily DD cap: dd=%.2f%% max=%.2f idle=%d", dd, DailyDD_MaxPct, idleBars);
+            dayBlocking=true;
+            if(idleBars >= DD_IdleUnlockBars){
+               if(Enable_Diagnostics) Print("[Gate] Daily DD idle unlock");
+               dayBlocking=false;
+               dailyGrace=true;
+               dailyGraceStamp=TimeCurrent();
+            } else {
+               blocked=true;
+            }
+         }
+      } else {
+         dayBlocking=false;
+         dailyGrace=false;
+      }
+   } else {
+      dayBlocking=false;
+      dailyGrace=false;
+   }
+
+   if(WeeklyDD_Enable && weekStartEquity>0.0){
+      double dd = 100.0*(weekStartEquity-AccountInfoDouble(ACCOUNT_EQUITY))/weekStartEquity;
+      if(dd > WeeklyDD_MaxPct){
+         if(weeklyGrace){
+            weekBlocking=false;
+         } else {
+            if(!weekBlocking && Enable_Diagnostics)
+               PrintFormat("[Gate] Weekly DD cap: dd=%.2f%% max=%.2f idle=%d", dd, WeeklyDD_MaxPct, idleBars);
+            weekBlocking=true;
+            if(idleBars >= DD_IdleUnlockBars){
+               if(Enable_Diagnostics) Print("[Gate] Weekly DD idle unlock");
+               weekBlocking=false;
+               weeklyGrace=true;
+               weeklyGraceStamp=TimeCurrent();
+            } else {
+               blocked=true;
+            }
+         }
+      } else {
+         weekBlocking=false;
+         weeklyGrace=false;
+      }
+   } else {
+      weekBlocking=false;
+      weeklyGrace=false;
+   }
+
+   return blocked;
+}
+
+bool RiskGateBlocks(){
+   static bool probeGranted=false;
+   static bool wasBlocking=false;
+   if(!RiskGate_Enable){ probeGranted=false; riskGateProbeMode=false; wasBlocking=false; return false; }
+
+   bool hit = (TradesToday>0 && ((gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week)));
+   if(!hit){ probeGranted=false; riskGateProbeMode=false; wasBlocking=false; return false; }
+
+   int idleBars = (gLastTradeTime>0)? int((TimeCurrent()-gLastTradeTime)/PeriodSeconds(PERIOD_M15)) : 9999;
+   if(idleBars >= RiskGate_Unlock_NoTradeBars){
+      if(Enable_Diagnostics) Print("[Gate] Risk gate idle unlock");
+      probeGranted=false; riskGateProbeMode=false; wasBlocking=false; return false;
+   }
+
+   if(RiskGate_ProbeOnce && !probeGranted){
+      riskGateProbeMode = true;
+      probeGranted = true;
+      return false;
+   }
+
+   riskGateProbeMode = false;
+   DiagnosticsCount("riskGate");
+   if(!wasBlocking && Enable_Diagnostics)
+      PrintFormat("[Gate] Risk gate block: R_day=%.2f R_week=%.2f", gR_day, gR_week);
+   wasBlocking = true;
+   return true;
 }
 
 bool EquityFilterOK(){
@@ -888,11 +1065,13 @@ void PrintStageInfo(int stage){
 bool TryEnter_WithProbe(bool probe_mode){
    if(!probe_mode) return TryEnter();
    ResetDailyCounters();
-   if(RiskGate_Enable){
-      if(TradesToday>0 && ((gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week))){
-         DiagnosticsCount("riskGate");
-         return LogAndReturnFalse("budget-gate");
-      }
+   if(DayLossCapBlocks()){
+      DiagnosticsCount("day-loss-cap");
+      return LogAndReturnFalse("day-loss-cap");
+   }
+   if(EquityDD_Gate()){
+      DiagnosticsCount("equity-dd-cap");
+      return LogAndReturnFalse("equity-dd-cap");
    }
    // Probe: relax momentum (still trend-aligned), min lot, ATR*Probe_ATR_mult SL, TP=Probe_TP_R
    if(HasOpenPosition()) return false;
@@ -924,21 +1103,20 @@ bool TryEnter_WithProbe(bool probe_mode){
 }
 
 bool TryEnter(){
-   riskGateProbeMode = false;
-
-   // Hard unlocks/guards: never perma-lock due to risk caps
    ResetDailyCounters();
-   if(!RiskGate_Enable){
-      // skip cap checks entirely
-   } else {
-      if(TradesToday>0 && ((gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week))){
-         DiagnosticsCount("riskGate");
-         return LogAndReturnFalse("budget-gate");
-      }
-   }
-
-   if(LossStreak_Protection && cooldownBarsRemaining>0)
+   if(LossStreak_Protection && cooldownBarsRemaining>0){
+      DiagnosticsCount("cooldown");
       return LogAndReturnFalse("cooldown");
+   }
+   if(DayLossCapBlocks()){
+      DiagnosticsCount("day-loss-cap");
+      return LogAndReturnFalse("day-loss-cap");
+   }
+   if(EquityDD_Gate()){
+      DiagnosticsCount("equity-dd-cap");
+      return LogAndReturnFalse("equity-dd-cap");
+   }
+   if(RiskGate_Enable && RiskGateBlocks())                return LogAndReturnFalse("risk-R-cap");
 
    string why="";
 
@@ -2087,6 +2265,9 @@ int OnInit(){
    dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    if(weekStartBalance<=0.0) weekStartBalance = dayStartBalance;
    MqlDateTime initDt; TimeCurrent(initDt); weekAnchorDayOfYear = initDt.day_of_year;
+   dayStartEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   weekStartEquity = dayStartEquity;
+   int _d,_w; DayWeekIds(TimeCurrent(),_d,_w); gDayId=_d; gWeekId=_w;
    dayLossCount = 0; quotaLossCount = 0;
    quotaPendingTicket = 0;
    quotaTradeActive = false;
@@ -2170,7 +2351,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
    if(riskMoney<=0.0)
       riskMoney = MathMax(0.01, AccountInfoDouble(ACCOUNT_BALANCE)*(Risk_Percent/100.0));
    double r = (riskMoney>0.0 ? profit / riskMoney : 0.0);
-   if(MathIsValidNumber(r)){
+   if(IsFiniteD(r)){
       gR_day += r;
       gR_week += r;
       R_today = gR_day;
@@ -2254,13 +2435,8 @@ void OnTick(){
       }
    }
 
-   bool newBar = NewM15Bar();
-   if(newBar){
-      // decrement cooldown once per M15 bar in all flows
-      if(LossStreak_Protection && cooldownBarsRemaining>0) cooldownBarsRemaining--;
-   } else {
-      return; // only evaluate entries once per new M15 bar
-   }
+   if(!NewM15Bar()) return; // only evaluate entries once per new M15 bar
+   if(LossStreak_Protection && cooldownBarsRemaining>0) cooldownBarsRemaining--;
    barsProcessed++; bool verboseBar = (Enable_Diagnostics && Verbose_First_N && (barsProcessed <= (ulong)Verbose_Bars_Limit));
    if(Diagnostics) PrintStageInfo(LoosenStage());
 
