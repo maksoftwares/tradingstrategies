@@ -2544,7 +2544,6 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
 void OnTick(){
    ResetDailyCounters();
    ResetRiskWindowsIfNeeded();
-   bool eqGateNow = EquityWinrateGateActive();
    double eqNow = AccountInfoDouble(ACCOUNT_EQUITY);
    if(peak_equity <= 0.0) peak_equity = eqNow;
    if(eqNow > peak_equity) peak_equity = eqNow;
@@ -2555,30 +2554,41 @@ void OnTick(){
    // manage open trade each tick
    ManagePartialAndTrail();
 
-   // If a gate is active, ensure no pending orders remain
-   if((RiskGate_Enable && gR_day <= DayLossCap_R) || eqGateNow){
-      for(int i=OrdersTotal()-1;i>=0;--i){
-         if(!OrderSelect((uint)i, SELECT_BY_POS, MODE_TRADES))
-            continue;
+   // If a gate is active, ensure no pending orders remain (MQL5-safe)
+   const bool eqGateNow = EquityWinrateGateActive();  // declare (or inline) the gate result
 
-         if((ulong)OrderGetInteger(ORDER_MAGIC) != Magic)
-            continue;
+   if ((RiskGate_Enable && gR_day <= DayLossCap_R) || eqGateNow)
+   {
+      const int total = OrdersTotal();
+      for (int i = total - 1; i >= 0; --i)
+      {
+         // MQL5: get ticket by list index, then select by ticket
+         const ulong ticket = OrderGetTicket(i);
+         if (ticket == 0) continue;
+         if (!OrderSelect(ticket)) continue;  // MQL5 signature: OrderSelect(ulong ticket)
 
-         ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-         bool isPending = (type==ORDER_TYPE_BUY_LIMIT || type==ORDER_TYPE_SELL_LIMIT ||
-                           type==ORDER_TYPE_BUY_STOP  || type==ORDER_TYPE_SELL_STOP);
-         if(!isPending)
-            continue;
+         // Only this EA’s orders
+         if ((ulong)OrderGetInteger(ORDER_MAGIC) != Magic) continue;
 
-         ENUM_ORDER_STATE state = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
-         if(state!=ORDER_STATE_PLACED && state!=ORDER_STATE_STARTED)
-            continue;
+         // Pending orders only
+         const ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         const bool isPending =
+            (type == ORDER_TYPE_BUY_LIMIT  || type == ORDER_TYPE_SELL_LIMIT ||
+             type == ORDER_TYPE_BUY_STOP   || type == ORDER_TYPE_SELL_STOP);
+         if (!isPending) continue;
 
-         ulong ticket = (ulong)OrderGetInteger(ORDER_TICKET);
-         if(ticket==0)
-            continue;
+         // Live/placed states only
+         const ENUM_ORDER_STATE state = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
+         if (state != ORDER_STATE_PLACED && state != ORDER_STATE_STARTED) continue;
 
+         // Delete using CTrade helper
+         trade.SetExpertMagicNumber(Magic);
          trade.OrderDelete(ticket);
+
+         // (Fallback raw API if needed)
+         // MqlTradeRequest rr; MqlTradeResult rs; ZeroMemory(rr); ZeroMemory(rs);
+         // rr.action = TRADE_ACTION_REMOVE; rr.order = ticket;
+         // OrderSend(rr, rs);
       }
    }
 
