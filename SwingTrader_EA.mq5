@@ -2170,7 +2170,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
    if(riskMoney<=0.0)
       riskMoney = MathMax(0.01, AccountInfoDouble(ACCOUNT_BALANCE)*(Risk_Percent/100.0));
    double r = (riskMoney>0.0 ? profit / riskMoney : 0.0);
-   if(MathIsValidNumber(r) && MathIsFinite(r)){
+   if(MathIsValidNumber(r)){
       gR_day += r;
       gR_week += r;
       R_today = gR_day;
