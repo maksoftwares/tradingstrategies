@@ -9,8 +9,9 @@
 
 #include <Trade/Trade.mqh>
 
-inline bool IsFiniteD(const double x){
-   return (x==x) && (x!=INFINITY) && (x!=-INFINITY);
+inline bool IsFiniteD(const double x)
+{
+   return MathIsValidNumber(x);
 }
 
 // --- Realized-R accounting and stall guards ---
