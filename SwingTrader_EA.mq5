@@ -2558,15 +2558,27 @@ void OnTick(){
    // If a gate is active, ensure no pending orders remain
    if((RiskGate_Enable && gR_day <= DayLossCap_R) || eqGateNow){
       for(int i=OrdersTotal()-1;i>=0;--i){
-         if(!OrderSelect(i, SELECT_BY_POS)) continue;
+         if(!OrderSelect((uint)i, SELECT_BY_POS, MODE_TRADES))
+            continue;
+
+         if((ulong)OrderGetInteger(ORDER_MAGIC) != Magic)
+            continue;
+
          ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-         if(type!=ORDER_TYPE_BUY_STOP && type!=ORDER_TYPE_SELL_STOP && type!=ORDER_TYPE_BUY_LIMIT && type!=ORDER_TYPE_SELL_LIMIT) continue;
-         if((ulong)OrderGetInteger(ORDER_MAGIC) != Magic) continue;
-         if(OrderGetInteger(ORDER_STATE)==ORDER_STATE_PLACED){
-            MqlTradeRequest rr; MqlTradeResult rres; ZeroMemory(rr); ZeroMemory(rres);
-            rr.action=TRADE_ACTION_REMOVE; rr.order=OrderGetInteger(ORDER_TICKET);
-            OrderSend(rr,rres);
-         }
+         bool isPending = (type==ORDER_TYPE_BUY_LIMIT || type==ORDER_TYPE_SELL_LIMIT ||
+                           type==ORDER_TYPE_BUY_STOP  || type==ORDER_TYPE_SELL_STOP);
+         if(!isPending)
+            continue;
+
+         ENUM_ORDER_STATE state = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
+         if(state!=ORDER_STATE_PLACED && state!=ORDER_STATE_STARTED)
+            continue;
+
+         ulong ticket = (ulong)OrderGetInteger(ORDER_TICKET);
+         if(ticket==0)
+            continue;
+
+         trade.OrderDelete(ticket);
       }
    }
 
