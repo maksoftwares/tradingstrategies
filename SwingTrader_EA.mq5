@@ -29,7 +29,7 @@ input double   MinStop_Points  = 50.0;     // absolute floor in points
 input int      ATR_Period      = 14;
 input double   ATR_SL_mult     = 2.5;      // SL = max(ATR*mult, swing buffer)
 input double   Swing_Buffer_ATR= 0.20;     // extra beyond fractal (as ATR multiple)
-input double   TP1_R           = 1.2;      // first partial (tighter for faster risk reduction)
+input double   TP1_R           = 1.5;      // first partial (tighter for faster risk reduction)
 input double   TP2_R           = 2.0;      // second partial / scale-out point
 input double   TP3_R           = 3.2;      // runner target
 input bool     Use_TP3         = true;     // enable third target
@@ -576,18 +576,15 @@ double NormalizePrice(double p){
 }
 
 void ResetDailyCounters(){
-   MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
-   int d = dt.day;
-   if(LastTradeDate != d){
+   static int last_d_id=-1, last_w_id=-1;
+   datetime now = TimeCurrent();
+   int d_id, w_id; DayWeekIds(now, d_id, w_id);
+   if(last_d_id!=d_id){
+      MqlDateTime dt; TimeToStruct(now, dt);
       TradesToday = 0;
-      LastTradeDate = d;
+      cooldownBarsRemaining = MathMax(0, cooldownBarsRemaining-1); // mild decay daily
+      LastTradeDate = dt.day;
       dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-      if(weekAnchorDayOfYear==-1 || dt.day_of_year - weekAnchorDayOfYear >= 5 || dt.day_of_week==1)
-      {
-         weekStartBalance = dayStartBalance;
-         weekAnchorDayOfYear = dt.day_of_year;
-      }
       dayLossCount = 0;
       quotaLossCount = 0;
       quotaTradeActive = false;
@@ -597,8 +594,14 @@ void ResetDailyCounters(){
       lastEntryBarTime = iTime(_Symbol,PERIOD_M15,0);
       probeBarsSinceEntry = 0;
       probeStopPts = 0.0;
-    }
- }
+      last_d_id = d_id;
+   }
+   if(last_w_id!=w_id){
+      weekStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      weekAnchorDayOfYear = DayOfYear(now);
+      last_w_id = w_id;
+   }
+}
 
 bool EquityFilterOK(){
    if(!Enable_Equity_Filter) return true;
@@ -1207,10 +1210,133 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
       }
    }
 
-   // If nothing fired and we still have 0 trades by midday, try probe once
-   MqlDateTime _dt; TimeCurrent(_dt);
-   if(Enable_Probe_Trade && TradesToday<DailyMinTrades && _dt.hour>=11 && _dt.hour<=18){
-      if(EnforceProbeTrade()) return true;
+   // --- Quota/Probe trade to ensure at least 1/day when clean signals absent ---
+   if(Enable_Daily_Min_Trade && TradesToday==0){
+      MqlDateTime dtQuota; TimeToStruct(TimeCurrent(), dtQuota);
+      if(dtQuota.hour>=Quota_Trigger_Hour && dtQuota.hour<=Quota_Final_Hour){
+         double atrQuota=0.0;
+         if(GetValue(hATR_M15,0,1,atrQuota)){
+            double atrPtsQuota = (atrQuota>0.0 ? atrQuota/_Point : 0.0);
+            double askQuota=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+            double bidQuota=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+            if(askQuota>0.0 && bidQuota>0.0 && atrPtsQuota>=Quota_Min_ATR_Points){
+               double spreadPtsQuota = (askQuota-bidQuota)/_Point;
+               bool spreadOk = SpreadOK_Dynamic(atrQuota);
+               if(atrPtsQuota>0.0 && Quota_MaxSpread_ATR_Frac>0.0 && spreadPtsQuota > Quota_MaxSpread_ATR_Frac * atrPtsQuota)
+                  spreadOk = false;
+               if(spreadOk){
+                  double emaFastH1=0.0, emaSlowH1=0.0;
+                  if(GetValue(hEMA_H1_fast,0,1,emaFastH1) && GetValue(hEMA_H1_slow,0,1,emaSlowH1)){
+                     bool upQuota = (emaFastH1>emaSlowH1);
+                     bool dnQuota = (emaFastH1<emaSlowH1);
+                     if(upQuota || dnQuota){
+                        int stopLevelQuota=(int)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
+                        double stopPtsQuota = MathMax((double)stopLevelQuota+5.0, ATR_SL_mult * atrPtsQuota);
+                        if(stopPtsQuota > 0.0){
+                           double baseLots = LotsFromRisk(stopPtsQuota);
+                           double lotsQuota = baseLots * Quota_Risk_Factor;
+                           double minLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+                           double maxLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+                           double stepLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+                           if(stepLot>0.0)
+                              lotsQuota = stepLot * MathFloor(lotsQuota/stepLot + 1e-6);
+                           lotsQuota = MathMin(lotsQuota, baseLots);
+                           lotsQuota = MathMax(minLot, MathMin(maxLot, lotsQuota));
+                           NormalizeVolume(lotsQuota);
+                           if(lotsQuota >= minLot && lotsQuota <= maxLot){
+                              double slBuy  = NormalizePrice(askQuota-PriceFromPoints(stopPtsQuota));
+                              double slSell = NormalizePrice(bidQuota+PriceFromPoints(stopPtsQuota));
+                              double tpQuota = 0.0;
+                              if(Quota_Use_Market){
+                                 trade.SetExpertMagicNumber(Magic);
+                                 trade.SetDeviationInPoints(50);
+                                 if(upQuota){
+                                    if(trade.Buy(lotsQuota,NULL,askQuota,slBuy,tpQuota,"QuotaBuy")){
+                                       TradesToday++;
+                                       partialTaken=false;
+                                       secondPartialTaken=false;
+                                       entryTime=TimeCurrent();
+                                       entryStopPoints=stopPtsQuota;
+                                       entryATRPoints=atrPtsQuota;
+                                       signalHigh=m15[1].high;
+                                       signalLow=m15[1].low;
+                                       structureBreakOccurred=false;
+                                       beMoved=false;
+                                       quotaTradeActive=true;
+                                       quotaPendingTicket=0;
+                                       probeStopPts=0.0;
+                                       probeBarsSinceEntry=0;
+                                       return true;
+                                    }
+                                 } else if(dnQuota){
+                                    if(trade.Sell(lotsQuota,NULL,bidQuota,slSell,tpQuota,"QuotaSell")){
+                                       TradesToday++;
+                                       partialTaken=false;
+                                       secondPartialTaken=false;
+                                       entryTime=TimeCurrent();
+                                       entryStopPoints=stopPtsQuota;
+                                       entryATRPoints=atrPtsQuota;
+                                       signalHigh=m15[1].high;
+                                       signalLow=m15[1].low;
+                                       structureBreakOccurred=false;
+                                       beMoved=false;
+                                       quotaTradeActive=true;
+                                       quotaPendingTicket=0;
+                                       probeStopPts=0.0;
+                                       probeBarsSinceEntry=0;
+                                       return true;
+                                    }
+                                 }
+                              } else {
+                                 MqlRates ratesQuota[2];
+                                 if(GetRates(PERIOD_M15,2,ratesQuota)){
+                                    MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
+                                    rq.action=TRADE_ACTION_PENDING;
+                                    rq.symbol=_Symbol;
+                                    rq.volume=lotsQuota;
+                                    rq.sl = (upQuota? slBuy : slSell);
+                                    rq.tp = tpQuota;
+                                    rq.magic=Magic;
+                                    rq.deviation=50;
+                                    rq.type_filling=ORDER_FILLING_FOK;
+                                    rq.type = (upQuota? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP);
+                                    rq.comment = (upQuota? "QuotaBuy" : "QuotaSell");
+                                    double trigger = (upQuota? NormalizePrice(ratesQuota[1].high + PriceFromPoints(Quota_EntryBufferPts))
+                                                           : NormalizePrice(ratesQuota[1].low  - PriceFromPoints(Quota_EntryBufferPts)));
+                                    if(upQuota && PointsFromPrice(trigger-askQuota) < stopLevelQuota+10)
+                                       trigger = NormalizePrice(askQuota + PriceFromPoints(stopLevelQuota+10));
+                                    if(dnQuota && PointsFromPrice(bidQuota-trigger) < stopLevelQuota+10)
+                                       trigger = NormalizePrice(bidQuota - PriceFromPoints(stopLevelQuota+10));
+                                    rq.price = trigger;
+                                    if(SafeOrderSend(rq,rs)){
+                                       pendingTicket = rs.order;
+                                       pendingDirection = (upQuota?1:0);
+                                       pendingExpiryBars = PendingOrder_Expiry_Bars;
+                                       signalHigh = m15[1].high;
+                                       signalLow  = m15[1].low;
+                                       partialTaken=false;
+                                       secondPartialTaken=false;
+                                       entryStopPoints=stopPtsQuota;
+                                       entryATRPoints=atrPtsQuota;
+                                       entryTime=TimeCurrent();
+                                       structureBreakOccurred=false;
+                                       beMoved=false;
+                                       quotaPendingTicket = rs.order;
+                                       quotaTradeActive=false;
+                                       probeStopPts=0.0;
+                                       probeBarsSinceEntry=0;
+                                       return true;
+                                    }
+                                 }
+                              }
+                           }
+                        }
+                     }
+                  }
+               }
+            }
+         }
+      }
    }
 
    if(TryProbeEntry()) return true;
@@ -1396,12 +1522,21 @@ bool TryProbeEntry()
    return false;
 }
 
-void DayWeekIds(datetime t, int &d_out, int &w_out){
+// --- Helpers: day-of-year & day/week ids (no TimeDayOfYear in MQL5) ---
+int DayOfYear(datetime t) {
+   MqlDateTime dt; TimeToStruct(t, dt);
+   MqlDateTime jan1;
+   jan1.year=dt.year; jan1.mon=1; jan1.day=1;
+   jan1.hour=0; jan1.min=0; jan1.sec=0;
+   jan1.day_of_week=0; jan1.day_of_year=0;
+   datetime d0=StructToTime(jan1);
+   return (int)((t - d0) / 86400) + 1;
+}
+void DayWeekIds(datetime t, int &d_out, int &w_out) {
    MqlDateTime dt; TimeToStruct(t, dt);
    d_out = dt.year*10000 + dt.mon*100 + dt.day;
-   // approximate ISO week: week number = day-of-year / 7 (good enough for gating reset)
-   int doy = (int)TimeDayOfYear(t);
-   w_out = dt.year*100 + (doy/7);
+   int doy = DayOfYear(t);
+   w_out = dt.year*100 + (doy / 7);   // coarse ISO week ok for gating
 }
 
 void ResetRiskWindowsIfNeeded(){
@@ -1482,6 +1617,12 @@ void RecordClosedTradeR(const ulong deal_id){
    }
 }
 
+// Daily/weekly risk caps (approx R-based and balance-based)
+// Track realized PnL of EA deals today/this week and block new entries if caps exceeded.
+// (Skeleton; wire to your existing counters if present.)
+// Example thresholds via inputs: DailyRiskMaxPct, WeeklyRiskMaxPct, MaxConsecLosses_Day.
+// At entry time: if(today_loss_pct >= DailyRiskMaxPct || weekly_loss_pct >= WeeklyRiskMaxPct || consec_losses_today >= MaxConsecLosses_Day)
+// block TryEnter() unless Allow_Probe_When_Capped is true with min lot.
 bool CapsAllowTrading(bool &probe_mode_out){
    ResetRiskWindowsIfNeeded();
    probe_mode_out = false;
@@ -1749,6 +1890,27 @@ void ManagePartialAndTrail(){
       }
    }
 
+   // --- Early abort: cut losers quickly in dead flow ---
+   if(entryTime>0){
+      int periodSec = PeriodSeconds(PERIOD_M15);
+      int barsHeld = (periodSec>0 ? (int)((TimeCurrent() - entryTime) / periodSec) : 0);
+      if(barsHeld <= EarlyAbort_Bars){
+         double bidEA=0.0, askEA=0.0; SymbolInfoDouble(_Symbol,SYMBOL_BID,bidEA); SymbolInfoDouble(_Symbol,SYMBOL_ASK,askEA);
+         double cur = (type==POSITION_TYPE_BUY ? bidEA : askEA);
+         double riskPts = MathMax(1.0, MathAbs(open-sl)/_Point);
+         double movePts = MathAbs(cur-open)/_Point;
+         bool adverse = (type==POSITION_TYPE_BUY ? cur < open : cur > open);
+         if(adverse && movePts < EarlyAbort_R * riskPts){
+            trade.SetExpertMagicNumber(Magic);
+            if(trade.PositionClose(_Symbol)){
+               partialTaken=false;
+               secondPartialTaken=false;
+               return;
+            }
+         }
+      }
+   }
+
    // Optional chandelier trail after BE
    if(Use_Trailing){
       double atr=0.0;
@@ -1950,11 +2112,13 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
       lastEntryStopPts = entryStopPoints;
       lastEntryBarTime = iTime(_Symbol,PERIOD_M15,0);
       probeBarsSinceEntry = 0;
+      string dealComment = HistoryDealGetString(dealId, DEAL_COMMENT);
+      bool commentQuota = (StringFind(dealComment, "Quota") >= 0);
       if(quotaPendingTicket>0 && trans.order == quotaPendingTicket){
          quotaTradeActive = true;
          quotaPendingTicket = 0;
       } else {
-         quotaTradeActive = false;
+         quotaTradeActive = commentQuota;
       }
       return;
    }
