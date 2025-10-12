@@ -9,6 +9,51 @@
 
 #include <Trade/Trade.mqh>
 
+// ------- Realized-R accounting (GLOBAL STATE) -------
+double   gR_day  = 0.0;
+double   gR_week = 0.0;
+int      gDayId  = -1;
+int      gWeekId = -1;
+datetime gLastTradeTime = 0;
+
+// Small ticket->risk map (single-position EA fits easily)
+ulong  gOpenTicket[16];
+double gOpenRiskMoney[16];
+int    gOpenCount = 0;
+
+void RiskMapPut(ulong ticket, double riskMoney)
+{
+   for(int i=0;i<gOpenCount;i++)
+      if(gOpenTicket[i]==ticket){ gOpenRiskMoney[i]=riskMoney; return; }
+   if(gOpenCount<16){
+      gOpenTicket[gOpenCount]=ticket;
+      gOpenRiskMoney[gOpenCount]=riskMoney;
+      gOpenCount++;
+   }
+}
+
+double RiskMapGet(ulong ticket)
+{
+   for(int i=0;i<gOpenCount;i++)
+      if(gOpenTicket[i]==ticket) return gOpenRiskMoney[i];
+   return 0.0;
+}
+
+double RiskMapPop(ulong ticket)
+{
+   for(int i=0;i<gOpenCount;i++)
+   {
+      if(gOpenTicket[i]==ticket){
+         double v=gOpenRiskMoney[i];
+         gOpenCount--;
+         gOpenTicket[i]=gOpenTicket[gOpenCount];
+         gOpenRiskMoney[i]=gOpenRiskMoney[gOpenCount];
+         return v;
+      }
+   }
+   return 0.0;
+}
+
 input group "=== Core Filters ==="
 input int      H1_EMA_Fast     = 50;
 input int      H1_EMA_Slow     = 200;
@@ -282,54 +327,6 @@ ulong    quotaPendingTicket = 0;
 bool     quotaTradeActive = false;
 datetime lastEntryBarTime = 0;
 
-// --- realized-R accounting ---
-double  gR_day=0.0, gR_week=0.0;
-int     gDayId=-1, gWeekId=-1;
-datetime gLastTradeTime=0;
-// simple ticket->risk map (single-position EA fits in small arrays)
-ulong gOpenTicket[16]; double gOpenRiskMoney[16]; int gOpenCount=0;
-void RiskMapPut(ulong ticket, double riskMoney){
-   for(int i=0;i<gOpenCount;i++) if(gOpenTicket[i]==ticket){ gOpenRiskMoney[i]=riskMoney; return; }
-   if(gOpenCount<16){ gOpenTicket[gOpenCount]=ticket; gOpenRiskMoney[gOpenCount]=riskMoney; gOpenCount++; }
-}
-double RiskMapGet(ulong ticket){
-   for(int i=0;i<gOpenCount;i++) if(gOpenTicket[i]==ticket) return gOpenRiskMoney[i];
-   return 0.0;
-}
-double RiskMapPop(ulong ticket){
-   for(int i=0;i<gOpenCount;i++){
-      if(gOpenTicket[i]==ticket){
-         double v=gOpenRiskMoney[i];
-         gOpenCount--; gOpenTicket[i]=gOpenTicket[gOpenCount]; gOpenRiskMoney[i]=gOpenRiskMoney[gOpenCount];
-         return v;
-      }
-   }
-   return 0.0;
-}
-
-bool RiskGateBlocksEntry(){
-   if(!RiskGate_Enable) return false;
-   ResetDailyCounters();
-   if(!MathIsValidNumber(gR_day) || !MathIsFinite(gR_day))   gR_day=0.0;
-   if(!MathIsValidNumber(gR_week)|| !MathIsFinite(gR_week)) gR_week=0.0;
-
-   static int barsSinceTrade=0;
-   barsSinceTrade++;
-   if(gLastTradeTime>0){
-      int barsIdle = int((TimeCurrent() - gLastTradeTime)/PeriodSeconds(PERIOD_M15));
-      barsSinceTrade = MathMax(0, barsIdle);
-   }
-   if(barsSinceTrade >= RiskGate_Unlock_NoTradeBars){
-      if(Enable_Diagnostics) Print("[Gate] idle-unlock after ",barsSinceTrade," bars");
-      return false;
-   }
-
-   bool blocked = (gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week);
-   if(blocked && Enable_Diagnostics)
-      PrintFormat("[Gate] Risk cap active: R_today=%.2f R_week=%.2f", gR_day, gR_week);
-   return blocked;
-}
-
 // --- Risk cap accounting (R-units) ---
 double R_today = 0.0;         // closed PnL in R for current day
 double R_week  = 0.0;         // closed PnL in R for current week
@@ -390,13 +387,14 @@ bool SafeOrderSend(MqlTradeRequest &rq, MqlTradeResult &rs);
 bool PlacePendingOrMarket(bool isLong, double lots, double pendPrice, double sl, double tp, const string tag);
 bool ProbeAllowed();
 bool TryProbeEntry();
-void DayWeekIds(datetime t, int &d_out, int &w_out);
+void DayWeekIds(const datetime t, int &d_out, int &w_out);
 void ResetRiskWindowsIfNeeded();
 double CurrentRiskPercent();
 void RecordClosedTradeR(const ulong deal_id);
 bool CapsAllowTrading(bool &probe_mode_out);
 void BumpProbeCounter(bool probe_mode);
 bool TryEnter_WithProbe(bool probe_mode);
+bool RiskGateBlocksEntry();
 
 void DiagnosticsPrintSummary(){
    if(!Enable_Diagnostics) return;
@@ -638,35 +636,23 @@ double NormalizePrice(double p){
    return NormalizeDouble(p,(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS));
 }
 
-void ResetDailyCounters(){
-   static int last_d_id=-1, last_w_id=-1;
-   datetime now = TimeCurrent();
-   int d_id, w_id; DayWeekIds(now, d_id, w_id);
-   if(gDayId!=d_id){ gDayId=d_id; gR_day=0.0; TradesToday=0; cooldownBarsRemaining=0; }
-   if(gWeekId!=w_id){ gWeekId=w_id; gR_week=0.0; }
+// Return yyyymmdd and yyyyWW (approx) for supplied time.
+void DayWeekIds(const datetime t, int &d_out, int &w_out){
+   MqlDateTime dt; TimeToStruct(t, dt);
+   d_out = dt.year*10000 + dt.mon*100 + dt.day;
+   // Approx week-id using day-of-year; avoids TimeDayOfYear dependency.
+   MqlDateTime jan1; jan1.year=dt.year; jan1.mon=1; jan1.day=1; jan1.hour=0; jan1.min=0; jan1.sec=0;
+   datetime d0 = StructToTime(jan1);
+   int doy = (int)((t - d0) / 86400) + 1; // 1..366
+   int wnum = doy / 7;                    // coarse ISO-like bucket
+   w_out = dt.year*100 + wnum;
+}
 
-   if(last_d_id!=d_id){
-      MqlDateTime dt; TimeToStruct(now, dt);
-      TradesToday = 0;
-      cooldownBarsRemaining = 0;
-      LastTradeDate = dt.day;
-      dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-      dayLossCount = 0;
-      quotaLossCount = 0;
-      quotaTradeActive = false;
-      quotaPendingTicket = 0;
-      barsSinceEntry = 0;
-      lastEntryStopPts = 0.0;
-      lastEntryBarTime = iTime(_Symbol,PERIOD_M15,0);
-      probeBarsSinceEntry = 0;
-      probeStopPts = 0.0;
-      last_d_id = d_id;
-   }
-   if(last_w_id!=w_id){
-      weekStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-      weekAnchorDayOfYear = DayOfYear(now);
-      last_w_id = w_id;
-   }
+void ResetDailyCounters(){
+   int dId, wId;
+   DayWeekIds(TimeCurrent(), dId, wId);
+   if(gDayId!=dId){ gDayId=dId; gR_day=0.0; TradesToday=0; cooldownBarsRemaining=0; }
+   if(gWeekId!=wId){ gWeekId=wId; gR_week=0.0; }
 }
 
 bool EquityFilterOK(){
@@ -1648,21 +1634,33 @@ int DayOfYear(datetime t) {
    datetime d0=StructToTime(jan1);
    return (int)((t - d0) / 86400) + 1;
 }
-void DayWeekIds(const datetime t, int &d_out, int &w_out){
-   MqlDateTime dt; TimeToStruct(t, dt);
-   d_out = dt.year*10000 + dt.mon*100 + dt.day;
-   // Approx week-id using day-of-year; avoids TimeDayOfYear dependency.
-   MqlDateTime jan1; jan1.year=dt.year; jan1.mon=1; jan1.day=1; jan1.hour=0; jan1.min=0; jan1.sec=0;
-   datetime d0 = StructToTime(jan1);
-   int doy = int((t - d0) / 86400) + 1;   // 1..366
-   int wnum = doy / 7;                    // coarse ISO-like bucket
-   w_out = dt.year*100 + wnum;
-}
-
 void ResetRiskWindowsIfNeeded(){
    int d,w; DayWeekIds(TimeCurrent(), d, w);
    if(day_id != d){ day_id = d; R_today = 0.0; probe_trades_today = 0; }
    if(week_id != w){ week_id = w; R_week = 0.0; }
+}
+
+bool RiskGateBlocksEntry(){
+   if(!RiskGate_Enable) return false;
+   ResetDailyCounters();
+   if(!MathIsValidNumber(gR_day))  gR_day=0.0;
+   if(!MathIsValidNumber(gR_week)) gR_week=0.0;
+
+   static int barsSinceTrade=0;
+   barsSinceTrade++;
+   if(gLastTradeTime>0){
+      int barsIdle = int((TimeCurrent() - gLastTradeTime)/PeriodSeconds(PERIOD_M15));
+      barsSinceTrade = MathMax(0, barsIdle);
+   }
+   if(barsSinceTrade >= RiskGate_Unlock_NoTradeBars){
+      if(Enable_Diagnostics) Print("[Gate] idle-unlock after ",barsSinceTrade," bars");
+      return false;
+   }
+
+   bool blocked = (gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week);
+   if(blocked && Enable_Diagnostics)
+      PrintFormat("[Gate] Risk cap active: R_today=%.2f R_week=%.2f", gR_day, gR_week);
+   return blocked;
 }
 
 double CurrentRiskPercent(){
@@ -2267,7 +2265,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
       riskMoney = MathMax(0.01, fallback);
    }
    double r = (riskMoney>0.0 ? profit / riskMoney : 0.0);
-   if(MathIsValidNumber(r) && MathIsFinite(r)){
+   if(MathIsValidNumber(r)){
       gR_day  += r;
       gR_week += r;
    }
