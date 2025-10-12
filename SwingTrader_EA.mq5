@@ -9,49 +9,42 @@
 
 #include <Trade/Trade.mqh>
 
-// ------- Realized-R accounting (GLOBAL STATE) -------
-double   gR_day  = 0.0;
-double   gR_week = 0.0;
-int      gDayId  = -1;
-int      gWeekId = -1;
-datetime gLastTradeTime = 0;
+// --- Realized-R accounting and stall guards ---
+double  gR_day=0.0, gR_week=0.0;
+int     gDayId=-1, gWeekId=-1;
+datetime gLastTradeTime=0;
+// tiny map for entry risk capture
+ulong gOpenTicket[16]; double gOpenRiskMoney[16]; int gOpenCount=0;
+void RiskMapPut(ulong t,double m){ for(int i=0;i<gOpenCount;i++) if(gOpenTicket[i]==t){ gOpenRiskMoney[i]=m; return; } if(gOpenCount<16){ gOpenTicket[gOpenCount]=t; gOpenRiskMoney[gOpenCount]=m; gOpenCount++; } }
+double RiskMapPop(ulong t){ for(int i=0;i<gOpenCount;i++){ if(gOpenTicket[i]==t){ double v=gOpenRiskMoney[i]; gOpenCount--; gOpenTicket[i]=gOpenTicket[gOpenCount]; gOpenRiskMoney[i]=gOpenRiskMoney[gOpenCount]; return v; } } return 0.0; }
 
-// Small ticket->risk map (single-position EA fits easily)
-ulong  gOpenTicket[16];
-double gOpenRiskMoney[16];
-int    gOpenCount = 0;
-
-void RiskMapPut(ulong ticket, double riskMoney)
-{
-   for(int i=0;i<gOpenCount;i++)
-      if(gOpenTicket[i]==ticket){ gOpenRiskMoney[i]=riskMoney; return; }
-   if(gOpenCount<16){
-      gOpenTicket[gOpenCount]=ticket;
-      gOpenRiskMoney[gOpenCount]=riskMoney;
-      gOpenCount++;
-   }
-}
-
-double RiskMapGet(ulong ticket)
-{
-   for(int i=0;i<gOpenCount;i++)
-      if(gOpenTicket[i]==ticket) return gOpenRiskMoney[i];
-   return 0.0;
-}
-
-double RiskMapPop(ulong ticket)
-{
-   for(int i=0;i<gOpenCount;i++)
-   {
-      if(gOpenTicket[i]==ticket){
-         double v=gOpenRiskMoney[i];
-         gOpenCount--;
-         gOpenTicket[i]=gOpenTicket[gOpenCount];
-         gOpenRiskMoney[i]=gOpenRiskMoney[gOpenCount];
-         return v;
+// recompute realized R from history since 'sinceTs' (closed deals only)
+double ComputeRealizedR(const datetime sinceTs,const int maxDeals=500){
+   double sumR=0.0;
+   const datetime toTs = TimeCurrent();
+   HistorySelect(sinceTs,toTs);
+   int deals = (int)HistoryDealsTotal();
+   int counted=0;
+   for(int i=deals-1;i>=0 && counted<maxDeals;i--){
+      ulong dealId = HistoryDealGetTicket(i);
+      if(!HistoryDealSelect(dealId)) continue;
+      if((ulong)HistoryDealGetInteger(dealId,DEAL_MAGIC) != Magic) continue;
+      if(HistoryDealGetInteger(dealId,DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+      string sym    = HistoryDealGetString(dealId,DEAL_SYMBOL);
+      double profit = HistoryDealGetDouble(dealId,DEAL_PROFIT)
+                    + HistoryDealGetDouble(dealId,DEAL_SWAP)
+                    + HistoryDealGetDouble(dealId,DEAL_COMMISSION);
+      ulong posId   = (ulong)HistoryDealGetInteger(dealId,DEAL_POSITION_ID);
+      double riskMoney = RiskMapPop(posId);  // may be 0 if EA restarted
+      if(riskMoney<=0){
+         double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+         riskMoney  = MathMax(0.01, bal * (Risk_Percent/100.0));
       }
+      double r = (riskMoney>0.0 ? profit/riskMoney : 0.0);
+      if(MathIsValidNumber(r)) sumR += r;
+      counted++;
    }
-   return 0.0;
+   return sumR;
 }
 
 input group "=== Core Filters ==="
@@ -75,11 +68,11 @@ input int      ATR_Period      = 14;
 input double   ATR_SL_mult     = 2.5;      // SL = max(ATR*mult, swing buffer)
 input double   Swing_Buffer_ATR= 0.20;     // extra beyond fractal (as ATR multiple)
 input double   TP1_R           = 1.00;     // first partial (tighter for faster risk reduction)
-input double   TP2_R           = 2.10;     // second partial / scale-out point
+input double   TP2_R           = 2.20;     // second partial / scale-out point
 input double   TP3_R           = 3.50;     // runner target
 input bool     Use_TP3         = true;     // enable third target
-input double   TP1_Close_Pct   = 0.50;     // portion to close at TP1
-input double   TP2_Close_Pct   = 0.30;     // portion to close at TP2 (rest trails / TP3)
+input double   TP1_Close_Pct   = 0.40;     // portion to close at TP1
+input double   TP2_Close_Pct   = 0.35;     // portion to close at TP2 (rest trails / TP3)
 input bool     Adaptive_R_Targets = true;  // adjust TP2/TP3 with volatility regime
 input int      ATR_Regime_Period  = 50;    // ATR SMA period for regime calc
 input double   HighVolRatio       = 1.30;  // ATR / ATR_SMA > this => high vol (stretch targets)
@@ -93,7 +86,7 @@ input double   Trail_ATR_mult  = 2.5;      // base trail
 input double   Trail_Tight_ATR_mult = 1.8; // tighter trail beyond trigger R
 input double   Trail_Tighten_Trigger_R = 2.0; // tighten trail after this R
 input bool     Use_Time_Exit   = true;     // exit stale trades
-input int      Max_Bars_In_Trade = 96;     // close if trade exceeds this many M15 bars (~24h)
+input int      Max_Bars_In_Trade = 144;    // close if trade exceeds this many M15 bars (~36h)
 input bool     Use_Vol_Compress_Exit = true; // exit if volatility collapses
 input double   Vol_Compress_Ratio = 0.65;  // ATR(now)/ATR(entry) below => exit if not reached 0.5R
 
@@ -110,8 +103,10 @@ input double Risk_Throttle_DD_Pct     = 20.0;    // when equity drawdown from pe
 input double Risk_Throttle_Pct        = 0.15;    // throttled risk % while in deep DD
 
 // --- Weekly equity cap (prevents overtrading after drawdown weeks)
-input bool   Use_Weekly_Risk_Cap   = true;
-input double WeeklyRiskCapPct      = 25.0;  // raised threshold
+input bool   Use_Weekly_Risk_Cap   = false;
+input bool   Use_Daily_Risk_Cap    = false;
+input double WeeklyRiskCapPct      = 30.0;  // raised threshold
+input double DailyRiskCapPct       = 15.0;  // daily cap when enabled
 double weekStartEquity = 0.0;
 int    lastWeekId = -1;
 
@@ -139,23 +134,23 @@ input group "=== Trend & Strength Filters ==="
 // Trend & Strength Filters
 input bool     Use_ADX_Filter         = true;
 input int      ADX_Period             = 14;
-input double   Min_ADX                = 18.0;  // minimum ADX strength requirement
+input double   Min_ADX                = 15.0;  // minimum ADX strength requirement
 input bool     Use_EMA200_Slope       = true;
 input int      EMA200_Slope_Lookback  = 10;
-input double   Min_EMA200_Slope_Pts   = 10.0;  // minimum EMA200 slope in points
+input double   Min_EMA200_Slope_Pts   = 6.0;   // minimum EMA200 slope in points
 input int      SlopeLookback          = 8;       // permissive slope lookback (new flow)
 input double   MinSlopePts            = 8;       // permissive minimum slope points (new flow)
 
 input group "=== Momentum Quality Thresholds ==="
-input double   RSI_Min_Long           = 52.5;   // require RSI above this for longs
-input double   RSI_Max_Short          = 47.5;   // require RSI below this for shorts
-input double   MACD_Min_Abs           = 0.10;   // min absolute MACD main beyond zero
+input double   RSI_Min_Long           = 51.0;   // require RSI above this for longs
+input double   RSI_Max_Short          = 49.0;   // require RSI below this for shorts
+input double   MACD_Min_Abs           = 0.06;   // min absolute MACD main beyond zero
 
 input group "=== Pullback / Structure Quality ==="
-input double   Min_Pull_Depth_ATR     = 0.12;   // minimum pullback depth as ATR fraction
-input double   Structure_Buffer_ATR   = 0.06;   // close must clear structure EMA by this ATR
+input double   Min_Pull_Depth_ATR     = 0.10;   // minimum pullback depth as ATR fraction
+input double   Structure_Buffer_ATR   = 0.05;   // close must clear structure EMA by this ATR
 input bool     Use_Structure_Space    = true;   // Minimum space filter to next structure
-input double   MinSpace_ATR           = 0.90;    // minimum ATR headroom
+input double   MinSpace_ATR           = 0.60;    // minimum ATR headroom
 input int      Space_Lookback_Bars    = 80;     // lookback bars to compute highest/lowest structure
 input int      SR_Lookback            = 20;     // swing high/low lookback for new flow
 
@@ -173,8 +168,8 @@ input int      Break_Buffer_Points    = 10;     // extra points above/below sign
 
 input group "=== Dynamic Spread & Sessions ==="
 input bool     Dynamic_Spread_Cap     = true;   // dynamic spread cap using ATR
-input double   Spread_ATR_Fraction    = 0.35;   // allowed spread = % of ATR (points)
-input int      HardSpreadCapPts       = 600;    // absolute safety ceiling
+input double   Spread_ATR_Fraction    = 0.40;   // allowed spread = % of ATR (points)
+input int      HardSpreadCapPts       = 1200;   // absolute safety ceiling
 input bool     Stage2_IgnoresSpread   = false;  // bypass spread check at stage 2 when no trades yet
 input bool     Enhanced_Session_Filter= false;  // refined session rules (DISABLED for 24h trading)
 input int      LondonNY_Start_Hour    = 6;      // Session start (0=all day)
@@ -204,10 +199,10 @@ input int    Quota_Kick_Hour        = 10;     // escalate from this hour (server
 input int    Quota_End_Hour         = 19;     // keep escalated looseness until here
 
 input group "=== Risk Gate (Realized R) ==="
-input bool   RiskGate_Enable        = true;
+input bool   RiskGate_Enable        = false;
 input double RiskGate_MinR_Day      = -2.5;     // lock for rest of day if <= this R
-input double RiskGate_MinR_Week     = -6.0;     // lock until new week if <= this R
-input int    RiskGate_Unlock_NoTradeBars = 160; // idle unlock threshold (M15 bars)
+input double RiskGate_MinR_Week     = -6.5;     // lock until new week if <= this R
+input int    RiskGate_Unlock_NoTradeBars = 120; // idle unlock threshold (M15 bars)
 input bool   RiskGate_ProbeOnce     = true;     // optional micro-probe after unlock
 input double RiskGate_ProbeLots     = 0.01;
 
@@ -216,15 +211,15 @@ input bool   AdaptiveLoosen     = true;  // enable dynamic threshold loosening i
 input int    DailyMinTrades     = 1;     // target minimum trades per day
 input int    LoosenHour1        = 12;    // first relax hour (server time)
 input int    LoosenHour2        = 16;    // second relax hour
-input int    ADX_Min_L0         = 18;    // base strict
-input int    ADX_Min_L1         = 16;    // first relax
-input int    ADX_Min_L2         = 14;    // second relax
+input int    ADX_Min_L0         = 15;    // base strict
+input int    ADX_Min_L1         = 14;    // first relax
+input int    ADX_Min_L2         = 13;    // second relax
 input double CI_Max_L0          = 50.0;  // compression index max stage 0
 input double CI_Max_L1          = 60.0;  // compression index max stage 1
 input double CI_Max_L2          = 70.0;  // compression index max stage 2
-input double MinSpace_ATR_L0    = 0.90;   // structure space stage 0
-input double MinSpace_ATR_L1    = 0.60;   // structure space stage 1
-input double MinSpace_ATR_L2    = 0.35;   // structure space stage 2
+input double MinSpace_ATR_L0    = 0.60;   // structure space stage 0
+input double MinSpace_ATR_L1    = 0.45;   // structure space stage 1
+input double MinSpace_ATR_L2    = 0.25;   // structure space stage 2
 input int    RSI_Mid_L2         = 49;    // slightly easier RSI midline at stage 2
 
 input group "=== Equity Gate & Probe Lane ==="
@@ -344,7 +339,7 @@ ulong  activeTradePositionId = 0;        // position identifier to map closes
 ulong barsProcessed=0;
 ulong rej_spread=0, rej_positionOpen=0, rej_session=0, rej_atrQuiet=0;
 ulong rej_trend=0, rej_pullback=0, rej_structure=0, rej_momentum=0, rej_candle=0, rej_extension=0;
-ulong rej_misc=0;
+ulong rej_misc=0, rej_riskGate=0;
 
 // additional rejection counters
 ulong rej_space=0, rej_cooldown=0, rej_spreadDynamic=0, rej_side=0, rej_slope=0;
@@ -362,6 +357,7 @@ int consecutiveLosses=0;
 int cooldownBarsRemaining=0;
 int TradesToday = 0;        // daily trade counter
 int LastTradeDate = -1;     // last date (day of month) we recorded trades
+bool riskGateProbeMode = false;      // when true clamp size to probe lots
 
 // forward declarations for new helpers
 int  LoosenStage();
@@ -390,11 +386,9 @@ bool TryProbeEntry();
 void DayWeekIds(const datetime t, int &d_out, int &w_out);
 void ResetRiskWindowsIfNeeded();
 double CurrentRiskPercent();
-void RecordClosedTradeR(const ulong deal_id);
 bool CapsAllowTrading(bool &probe_mode_out);
 void BumpProbeCounter(bool probe_mode);
 bool TryEnter_WithProbe(bool probe_mode);
-bool RiskGateBlocksEntry();
 
 void DiagnosticsPrintSummary(){
    if(!Enable_Diagnostics) return;
@@ -416,8 +410,11 @@ void DiagnosticsPrintSummary(){
          " Cooldown=",rej_cooldown,
          " DynSpread=",rej_spreadDynamic,
          " Side=",rej_side,
-         " Slope=",rej_slope);
-   Print(" [GateEq]", rej_equityGate, " [Probe]", probeEntries);
+         " Slope=",rej_slope,
+         " RiskGate=",rej_riskGate);
+   Print(" [GateEq]", rej_equityGate, " [Probe]", probeEntries,
+         " R_day=", DoubleToString(gR_day,2),
+         " R_week=", DoubleToString(gR_week,2));
 }
 
 void DiagnosticsCount(const string tag){
@@ -432,6 +429,7 @@ void DiagnosticsCount(const string tag){
    else if(tag=="momentum") rej_momentum++;
    else if(tag=="candle") rej_candle++;
    else if(tag=="extension") rej_extension++;
+   else if(tag=="riskGate") rej_riskGate++;
       else if(tag=="space") rej_space++;
       else if(tag=="cooldown") rej_cooldown++;
       else if(tag=="dynSpread") rej_spreadDynamic++;
@@ -636,16 +634,14 @@ double NormalizePrice(double p){
    return NormalizeDouble(p,(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS));
 }
 
-// Return yyyymmdd and yyyyWW (approx) for supplied time.
+// yyyymmdd and yyyyWW (coarse) without TimeDayOfYear dependency
 void DayWeekIds(const datetime t, int &d_out, int &w_out){
    MqlDateTime dt; TimeToStruct(t, dt);
    d_out = dt.year*10000 + dt.mon*100 + dt.day;
-   // Approx week-id using day-of-year; avoids TimeDayOfYear dependency.
    MqlDateTime jan1; jan1.year=dt.year; jan1.mon=1; jan1.day=1; jan1.hour=0; jan1.min=0; jan1.sec=0;
-   datetime d0 = StructToTime(jan1);
-   int doy = (int)((t - d0) / 86400) + 1; // 1..366
-   int wnum = doy / 7;                    // coarse ISO-like bucket
-   w_out = dt.year*100 + wnum;
+   const datetime d0 = StructToTime(jan1);
+   const int doy = int((t - d0)/86400) + 1;  // 1..366
+   w_out = dt.year*100 + (doy/7);
 }
 
 void ResetDailyCounters(){
@@ -675,16 +671,16 @@ bool EquityFilterOK(){
 
 bool RiskBudgetOK(){
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
-   if(dayStartBalance>0.0){
+   if(Use_Daily_Risk_Cap && dayStartBalance>0.0){
       double ddDay = 100.0 * (dayStartBalance - bal) / dayStartBalance;
-      if(ddDay >= DailyRiskMaxPct){
+      if(ddDay >= DailyRiskCapPct){
          if(Enable_Diagnostics) PrintFormat("[Gate] Daily risk cap hit: %.2f%%", ddDay);
          return false;
       }
    }
-   if(weekStartBalance>0.0){
+   if(Use_Weekly_Risk_Cap && weekStartBalance>0.0){
       double ddW = 100.0 * (weekStartBalance - bal) / weekStartBalance;
-      if(ddW >= WeeklyRiskMaxPct){
+      if(ddW >= WeeklyRiskCapPct){
          if(Enable_Diagnostics) PrintFormat("[Gate] Weekly risk cap hit: %.2f%%", ddW);
          return false;
       }
@@ -891,7 +887,13 @@ void PrintStageInfo(int stage){
 // Wrapper to allow probe-mode trading under caps
 bool TryEnter_WithProbe(bool probe_mode){
    if(!probe_mode) return TryEnter();
-   if(RiskGateBlocksEntry()) return false;
+   ResetDailyCounters();
+   if(RiskGate_Enable){
+      if(TradesToday>0 && ((gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week))){
+         DiagnosticsCount("riskGate");
+         return LogAndReturnFalse("budget-gate");
+      }
+   }
    // Probe: relax momentum (still trend-aligned), min lot, ATR*Probe_ATR_mult SL, TP=Probe_TP_R
    if(HasOpenPosition()) return false;
    MqlRates m15[3]; if(!GetRates(PERIOD_M15,3,m15)) return false;
@@ -922,6 +924,22 @@ bool TryEnter_WithProbe(bool probe_mode){
 }
 
 bool TryEnter(){
+   riskGateProbeMode = false;
+
+   // Hard unlocks/guards: never perma-lock due to risk caps
+   ResetDailyCounters();
+   if(!RiskGate_Enable){
+      // skip cap checks entirely
+   } else {
+      if(TradesToday>0 && ((gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week))){
+         DiagnosticsCount("riskGate");
+         return LogAndReturnFalse("budget-gate");
+      }
+   }
+
+   if(LossStreak_Protection && cooldownBarsRemaining>0)
+      return LogAndReturnFalse("cooldown");
+
    string why="";
 
    // Equity gate with stall-grace
@@ -939,8 +957,6 @@ bool TryEnter(){
       }
    }
 
-   if(RiskGateBlocksEntry()) return LogAndReturnFalse("riskGate");
-
    // --- MinBars Guard: Prevent early-begin history artifact ---
    if(Bars(_Symbol,PERIOD_M15) < MinBarsForSignals){ AppendReason(why,"minBars"); return LogAndReturnFalse(why); }
 
@@ -949,7 +965,7 @@ bool TryEnter(){
    if(!GetRates(PERIOD_M15,3,m15)) { AppendReason(why,"rates"); return LogAndReturnFalse(why); }
    double body = MathAbs(m15[1].close - m15[1].open);
    double range= (m15[1].high - m15[1].low);
-   bool   bodyOK = (range>0 && (body/range) >= 0.35);
+   bool   bodyOK = (range>0 && (body/range) >= 0.25);
    if(!bodyOK) { AppendReason(why,"weakBody"); return LogAndReturnFalse(why); }
    double atr;
    if(!GetValue(hATR_M15,0,1,atr)) { AppendReason(why,"atr"); return LogAndReturnFalse(why); }
@@ -964,11 +980,6 @@ bool TryEnter(){
    
    if(!SessionAllowed()) { AppendReason(why,"session"); return LogAndReturnFalse(why); }
    if(HasOpenPosition()) { AppendReason(why,"openPos"); return LogAndReturnFalse(why); }
-   int stage_for_cd = LoosenStage();
-   if(LossStreak_Protection && cooldownBarsRemaining>0) {
-      if(TradesToday==0 && stage_for_cd==2) { cooldownBarsRemaining=0; }
-      else if(!Cooldown_Stage0_Only || stage_for_cd==0) { AppendReason(why,"cooldown"); return LogAndReturnFalse(why); }
-   }
 
    double emaPull_1, emaStruct_1, emaFastH1, emaSlowH1;
    if(!GetValue(hEMA_M15_pull,0,1,emaPull_1) || !GetValue(hEMA_M15_struct,0,1,emaStruct_1) || !GetValue(hEMA_H1_fast,0,1,emaFastH1) || !GetValue(hEMA_H1_slow,0,1,emaSlowH1)) { AppendReason(why,"ema"); return LogAndReturnFalse(why); }
@@ -997,6 +1008,8 @@ bool TryEnter(){
    bool rsiDown=(rsi_prev>50 && rsi_curr<50);
    bool longMomentum = RequireBothMomentum ? (macdUp && rsiUp) : (macdUp || rsiUp);
    bool shortMomentum= RequireBothMomentum ? (macdDown && rsiDown) : (macdDown || rsiDown);
+   double macdAbs = MathAbs(macd_curr);
+   bool macdAbsOK = (macdAbs >= MACD_Min_Abs);
 
    double macdSig_1=0.0;
    if(!GetValue(hMACD_M15,1,1,macdSig_1)) macdSig_1=macd_curr;
@@ -1016,6 +1029,14 @@ bool TryEnter(){
 
    longMomentum  = longMomentum  && macdRising  && rsiSlopeUp   && rsi_curr >= RSI_Min_Long;
    shortMomentum = shortMomentum && macdFalling && rsiSlopeDown && rsi_curr <= RSI_Max_Short;
+
+   if(stage==2 && RequireBothMomentum){
+      // Stage-2 relax: allow OR momentum when MACD magnitude passes threshold
+      bool longOr  = macdAbsOK && ( (macdUp || rsiUp)     && macdRising  && rsiSlopeUp   && rsi_curr >= RSI_Min_Long);
+      bool shortOr = macdAbsOK && ( (macdDown || rsiDown) && macdFalling && rsiSlopeDown && rsi_curr <= RSI_Max_Short);
+      if(!longMomentum)  longMomentum  = longOr;
+      if(!shortMomentum) shortMomentum = shortOr;
+   }
 
    bool pullLong = (m15[1].low <= emaPull_1) && ((emaPull_1 - m15[1].low) >= Min_Pull_Depth_ATR * atr);
    bool pullShort= (m15[1].high >= emaPull_1) && ((m15[1].high - emaPull_1) >= Min_Pull_Depth_ATR * atr);
@@ -1115,6 +1136,7 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
       if(stopPts > MAX_SL_PTS) stopPts = MAX_SL_PTS;
       double stopDistPrice=PriceFromPoints(stopPts);
       double lots=LotsByRiskSafe(stopPts);
+      if(riskGateProbeMode) lots = MathMin(lots, RiskGate_ProbeLots);
       lots = ApplyFailSafeRisk(lots, failSafeActive);
       if(lots<=0){ AppendReason(why,"noLots"); return LogAndReturnFalse(why); }
       NormalizeVolume(lots);
@@ -1149,6 +1171,7 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
       if(stopPts > MAX_SL_PTS) stopPts = MAX_SL_PTS;
       double stopDistPrice=PriceFromPoints(stopPts);
       double lots=LotsByRiskSafe(stopPts);
+      if(riskGateProbeMode) lots = MathMin(lots, RiskGate_ProbeLots);
       lots = ApplyFailSafeRisk(lots, failSafeActive);
       if(lots<=0){ AppendReason(why,"noLots"); return LogAndReturnFalse(why); }
       NormalizeVolume(lots);
@@ -1248,6 +1271,7 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
          double stopDistPrice = PriceFromPoints(stopPts);
          double ask2=ask, bid2=bid; double slLong=NormalizePrice(ask2-stopDistPrice); double slShort=NormalizePrice(bid2+stopDistPrice);
          double lotsAlt = LotsByRiskSafe(stopPts);
+         if(riskGateProbeMode) lotsAlt = MathMin(lotsAlt, RiskGate_ProbeLots);
          lotsAlt = ApplyFailSafeRisk(lotsAlt, failSafeActive);
          if(lotsAlt>0){
             NormalizeVolume(lotsAlt);
@@ -1640,29 +1664,6 @@ void ResetRiskWindowsIfNeeded(){
    if(week_id != w){ week_id = w; R_week = 0.0; }
 }
 
-bool RiskGateBlocksEntry(){
-   if(!RiskGate_Enable) return false;
-   ResetDailyCounters();
-   if(!MathIsValidNumber(gR_day))  gR_day=0.0;
-   if(!MathIsValidNumber(gR_week)) gR_week=0.0;
-
-   static int barsSinceTrade=0;
-   barsSinceTrade++;
-   if(gLastTradeTime>0){
-      int barsIdle = int((TimeCurrent() - gLastTradeTime)/PeriodSeconds(PERIOD_M15));
-      barsSinceTrade = MathMax(0, barsIdle);
-   }
-   if(barsSinceTrade >= RiskGate_Unlock_NoTradeBars){
-      if(Enable_Diagnostics) Print("[Gate] idle-unlock after ",barsSinceTrade," bars");
-      return false;
-   }
-
-   bool blocked = (gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week);
-   if(blocked && Enable_Diagnostics)
-      PrintFormat("[Gate] Risk cap active: R_today=%.2f R_week=%.2f", gR_day, gR_week);
-   return blocked;
-}
-
 double CurrentRiskPercent(){
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    if(peak_equity <= 0.0) peak_equity = eq;
@@ -1671,68 +1672,6 @@ double CurrentRiskPercent(){
    double base = Risk_Percent_Base;
    if(dd_pct >= Risk_Throttle_DD_Pct) base = MathMin(base, Risk_Throttle_Pct);
    return base;
-}
-
-void RecordClosedTradeR(const ulong deal_id){
-   ResetRiskWindowsIfNeeded();
-   if(!HistoryDealSelect(deal_id)) return;
-   long magic = (long)HistoryDealGetInteger(deal_id, DEAL_MAGIC);
-   if((ulong)magic != Magic) return;
-
-   long entryType = HistoryDealGetInteger(deal_id, DEAL_ENTRY);
-   if(entryType != DEAL_ENTRY_OUT) return;
-
-   // Profit in account currency
-   double profit = HistoryDealGetDouble(deal_id, DEAL_PROFIT)
-                 + HistoryDealGetDouble(deal_id, DEAL_SWAP)
-                 + HistoryDealGetDouble(deal_id, DEAL_COMMISSION);
-
-   ulong positionId = (ulong)HistoryDealGetInteger(deal_id, DEAL_POSITION_ID);
-   double riskCash = activeTradeRiskCash;
-   if(positionId != 0 && activeTradePositionId != 0 && positionId != activeTradePositionId)
-      riskCash = 0.0;
-
-   if(riskCash <= 0.0){
-      double stop_pts = entryStopPoints;
-      if(stop_pts <= 0.0) stop_pts = probeStopPts;
-      if(stop_pts <= 0.0){
-         double atrLast=0.0;
-         if(GetValue(hATR_M15,0,1,atrLast)) stop_pts = MathMax(1.0, atrLast/_Point);
-      }
-      double tick_value = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
-      double tick_size  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
-      double baseLots = (activeTradeInitialLots>0.0? activeTradeInitialLots : HistoryDealGetDouble(deal_id, DEAL_VOLUME));
-      double one_r_cash_per_lot = activeTradeOneRCashPerLot;
-      if(one_r_cash_per_lot <= 0.0 && stop_pts>0.0 && tick_value>0.0 && tick_size>0.0)
-         one_r_cash_per_lot = (stop_pts*_Point/MathMax(1e-10, tick_size)) * tick_value;
-      if(one_r_cash_per_lot>0.0 && baseLots>0.0)
-         riskCash = one_r_cash_per_lot * baseLots;
-   }
-
-   if(riskCash <= 0.0) return;
-
-   double r_units = (riskCash!=0.0 ? profit/riskCash : 0.0);
-
-   R_today += r_units;
-   R_week  += r_units;
-
-   if(positionId != 0 && positionId == activeTradePositionId){
-      double closedVol = HistoryDealGetDouble(deal_id, DEAL_VOLUME);
-      activeTradeRemainingLots = MathMax(0.0, activeTradeRemainingLots - closedVol);
-      if(activeTradeRemainingLots <= 0.0 || !PositionSelect(_Symbol)){
-         activeTradeRiskCash = 0.0;
-         activeTradeOneRCashPerLot = 0.0;
-         activeTradeInitialLots = 0.0;
-         activeTradeRemainingLots = 0.0;
-         activeTradePositionId = 0;
-      }
-   } else if(!PositionSelect(_Symbol)){
-      activeTradeRiskCash = 0.0;
-      activeTradeOneRCashPerLot = 0.0;
-      activeTradeInitialLots = 0.0;
-      activeTradeRemainingLots = 0.0;
-      activeTradePositionId = 0;
-   }
 }
 
 // Daily/weekly risk caps (approx R-based and balance-based)
@@ -2178,46 +2117,32 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
    if(trans.type!=TRADE_TRANSACTION_DEAL_ADD) return;
    if(!HistoryDealSelect(trans.deal)) return;
 
-   long  magic = (long)HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+   long magic = (long)HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
    if((ulong)magic != Magic) return;
 
-   long  entryType = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
-   string sym      = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
-   double volume   = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
-   ulong  ticket   = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+   long   entryType = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   string sym       = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+   double volume    = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+   ulong  ticket    = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
 
    if(entryType == DEAL_ENTRY_IN){
-      double sl = HistoryDealGetDouble(trans.deal, DEAL_SL);
-      double price = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
-      double riskMoney = 0.0;
-      if(sl>0 && volume>0){
-         double tick_value = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-         double tick_size  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
-         double stop_price = MathAbs(price - sl);
-         double ticks      = (tick_size>0? stop_price / tick_size : 0);
-         double riskMoneyPerLot = ticks * tick_value;
-         riskMoney = riskMoneyPerLot * volume;
+      double sl       = HistoryDealGetDouble(trans.deal, DEAL_SL);
+      double price    = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+      double tickValue= SymbolInfoDouble(sym,SYMBOL_TRADE_TICK_VALUE);
+      double tickSize = SymbolInfoDouble(sym,SYMBOL_TRADE_TICK_SIZE);
+      double riskMoney= 0.0;
+      if(volume>0.0 && sl>0.0 && tickSize>0.0 && tickValue>0.0){
+         double ticks = MathAbs(price-sl) / tickSize;
+         riskMoney = MathMax(0.01, ticks * tickValue * volume);
       }
-      if(riskMoney<=0){
-         double stopPts = entryStopPoints;
-         if(stopPts <= 0.0) stopPts = probeStopPts;
-         if(stopPts <= 0.0){
-            double atrLast=0.0;
-            if(GetValue(hATR_M15,0,1,atrLast)) stopPts = MathMax(1.0, atrLast/_Point);
-         }
-         double tick_value = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-         double tick_size  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
-         if(stopPts>0.0 && tick_value>0.0 && tick_size>0.0 && volume>0.0){
-            double perLot = (stopPts*_Point/MathMax(1e-10, tick_size)) * tick_value;
-            riskMoney = perLot * MathMax(volume, SymbolInfoDouble(sym,SYMBOL_VOLUME_MIN));
-         }
-      }
-      if(riskMoney>0) RiskMapPut(ticket, riskMoney);
+      if(riskMoney>0.0) RiskMapPut(ticket, riskMoney);
+
       activeTradeRiskCash = riskMoney;
-      activeTradeOneRCashPerLot = (volume>0.0 ? riskMoney/volume : 0.0);
+      activeTradeOneRCashPerLot = (volume>0.0 ? (riskMoney/MathMax(volume,1e-9)) : 0.0);
       activeTradeInitialLots = volume;
       activeTradeRemainingLots = volume;
       activeTradePositionId = ticket;
+
       gLastTradeTime = TimeCurrent();
 
       TradesToday++;
@@ -2238,14 +2163,24 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
 
    if(entryType != DEAL_ENTRY_OUT) return;
 
-   RecordClosedTradeR(trans.deal);
-
    double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
                  + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
                  + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+   double riskMoney = RiskMapPop(ticket);
+   if(riskMoney<=0.0)
+      riskMoney = MathMax(0.01, AccountInfoDouble(ACCOUNT_BALANCE)*(Risk_Percent/100.0));
+   double r = (riskMoney>0.0 ? profit / riskMoney : 0.0);
+   if(MathIsValidNumber(r)){
+      gR_day += r;
+      gR_week += r;
+      R_today = gR_day;
+      R_week  = gR_week;
+   }
+   gLastTradeTime = TimeCurrent();
+
    long dealType = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
    bool isBuy = (dealType==DEAL_TYPE_BUY);
-   bool win = (profit > 0.0);
+   bool win   = (profit > 0.0);
    UpdateSidePerformance(isBuy, win);
 
    double outcome = (profit>0.0 ? 1.0 : (profit<0.0 ? -1.0 : 0.0));
@@ -2259,28 +2194,17 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
       dayLossCount = 0;
    }
 
-   double riskMoney = RiskMapGet(ticket);
-   if(riskMoney<=0){
-      double fallback = AccountInfoDouble(ACCOUNT_BALANCE) * (Risk_Percent/100.0);
-      riskMoney = MathMax(0.01, fallback);
-   }
-   double r = (riskMoney>0.0 ? profit / riskMoney : 0.0);
-   if(MathIsValidNumber(r)){
-      gR_day  += r;
-      gR_week += r;
-   }
-
    bool positionGone = (!PositionSelect(sym) || (ulong)PositionGetInteger(POSITION_MAGIC)!=Magic);
    if(positionGone) RiskMapPop(ticket);
 
-   if(profit < 0){
+   if(profit < 0.0){
       consecutiveLosses++;
       if(LossStreak_Protection && consecutiveLosses >= Max_Loss_Streak){
          cooldownBarsRemaining = Loss_Cooldown_Bars;
-         if(Enable_Diagnostics) Print("[Diag] Loss streak triggered cooldown bars=",cooldownBarsRemaining);
+         if(Enable_Diagnostics) Print("[Diag] Loss streak cooldown=",cooldownBarsRemaining);
          consecutiveLosses = 0;
       }
-   } else if(profit > 0){
+   } else if(profit > 0.0){
       consecutiveLosses = 0;
    }
 
@@ -2289,7 +2213,24 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
    lastEntryStopPts = 0.0;
    probeBarsSinceEntry = 0;
    probeStopPts = 0.0;
-   gLastTradeTime = TimeCurrent();
+
+   if(ticket == activeTradePositionId){
+      double closedVol = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+      activeTradeRemainingLots = MathMax(0.0, activeTradeRemainingLots - closedVol);
+      if(activeTradeRemainingLots <= 0.0 || !PositionSelect(sym)){
+         activeTradeRiskCash = 0.0;
+         activeTradeOneRCashPerLot = 0.0;
+         activeTradeInitialLots = 0.0;
+         activeTradeRemainingLots = 0.0;
+         activeTradePositionId = 0;
+      }
+   } else if(!PositionSelect(sym)){
+      activeTradeRiskCash = 0.0;
+      activeTradeOneRCashPerLot = 0.0;
+      activeTradeInitialLots = 0.0;
+      activeTradeRemainingLots = 0.0;
+      activeTradePositionId = 0;
+   }
 }
 
 void OnTick(){
@@ -2313,9 +2254,13 @@ void OnTick(){
       }
    }
 
-   if(!NewM15Bar()) return; // only evaluate entries once per new M15 bar
-   // cooldown tick-down on each new bar
-   if(LossStreak_Protection && cooldownBarsRemaining>0) cooldownBarsRemaining--;
+   bool newBar = NewM15Bar();
+   if(newBar){
+      // decrement cooldown once per M15 bar in all flows
+      if(LossStreak_Protection && cooldownBarsRemaining>0) cooldownBarsRemaining--;
+   } else {
+      return; // only evaluate entries once per new M15 bar
+   }
    barsProcessed++; bool verboseBar = (Enable_Diagnostics && Verbose_First_N && (barsProcessed <= (ulong)Verbose_Bars_Limit));
    if(Diagnostics) PrintStageInfo(LoosenStage());
 
@@ -2434,6 +2379,7 @@ void OnTick(){
          double stopPts = MathMax(rawStopPts, minStopPtsFloor);
          double stopDistPrice = PriceFromPoints(stopPts);
          double lots = LotsByRiskSafe(stopPts);
+         if(riskGateProbeMode) lots = MathMin(lots, RiskGate_ProbeLots);
          lots = ApplyFailSafeRisk(lots, failSafeLegacy);
          if(lots>0){
             NormalizeVolume(lots);
@@ -2506,6 +2452,7 @@ void OnTick(){
          double stopPts = MathMax(rawStopPts, minStopPtsFloor);
          double stopDistPrice = PriceFromPoints(stopPts);
          double lots = LotsByRiskSafe(stopPts);
+         if(riskGateProbeMode) lots = MathMin(lots, RiskGate_ProbeLots);
          lots = ApplyFailSafeRisk(lots, failSafeLegacy);
          if(lots>0){
             NormalizeVolume(lots);
