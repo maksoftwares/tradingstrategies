@@ -18,6 +18,7 @@ inline bool IsFiniteD(const double x)
 double  gR_day=0.0, gR_week=0.0;
 int     gDayId=-1, gWeekId=-1;
 datetime gLastTradeTime=0;
+double  dayStartEquity=0.0, weekStartEquity=0.0;
 // tiny map for entry risk capture
 ulong gOpenTicket[16]; double gOpenRiskMoney[16]; int gOpenCount=0;
 void RiskMapPut(ulong t,double m){ for(int i=0;i<gOpenCount;i++) if(gOpenTicket[i]==t){ gOpenRiskMoney[i]=m; return; } if(gOpenCount<16){ gOpenTicket[gOpenCount]=t; gOpenRiskMoney[gOpenCount]=m; gOpenCount++; } }
@@ -65,7 +66,7 @@ input int      MACD_Slow       = 26;
 input int      MACD_Signal     = 9;
 
 input group "=== Risk & Money Management ==="
-input double   Risk_Percent    = 0.75;     // % of balance per trade
+input double   Risk_Percent    = 0.60;     // % of balance per trade
 input double   MaxRiskLotsCap  = 0.10;     // hard cap per trade
 input double   MinStop_ATR     = 1.0;      // ensure SL distance >= 1×ATR
 input double   MinStop_Points  = 50.0;     // absolute floor in points
@@ -107,12 +108,25 @@ input double Probe_TP_R               = 1.0;     // TP for probes
 input double Risk_Throttle_DD_Pct     = 20.0;    // when equity drawdown from peak exceeds this %, throttle risk
 input double Risk_Throttle_Pct        = 0.15;    // throttled risk % while in deep DD
 
+input group "=== Drawdown Recovery Gates ==="
+input bool     DailyDD_Enable         = true;
+input double   DailyDD_MaxPct         = 18.0;
+input bool     WeeklyDD_Enable        = true;
+input double   WeeklyDD_MaxPct        = 35.0;
+input int      DD_IdleUnlockBars      = 64;
+
+input group "=== Day Loss Cap ==="
+input bool   DayLossCap_Enable         = true;
+input int    DayLossCap_MaxLosses      = 3;
+input double DayLossCap_MinR           = -3.0;
+input int    DayLossCap_LockBars       = 32;  // ~8h on M15
+input int    DayLossCap_IdleUnlockBars = 64;
+
 // --- Weekly equity cap (prevents overtrading after drawdown weeks)
 input bool   Use_Weekly_Risk_Cap   = false;
 input bool   Use_Daily_Risk_Cap    = false;
 input double WeeklyRiskCapPct      = 30.0;  // raised threshold
 input double DailyRiskCapPct       = 15.0;  // daily cap when enabled
-double weekStartEquity = 0.0;
 int    lastWeekId = -1;
 
 input group "=== Trade Hygiene ==="
@@ -187,8 +201,8 @@ input bool     Stage2_OverrideSession = false;  // Allow entries at stage 2 rega
 
 input group "=== Loss Streak & Side Control ==="
 input bool     LossStreak_Protection  = true;   // pause after loss streak
-input int      Max_Loss_Streak        = 3;
-input int      Loss_Cooldown_Bars     = 4;      // bars to pause after hitting loss streak
+input int      Max_Loss_Streak        = 2;
+input int      Loss_Cooldown_Bars     = 6;      // bars to pause after hitting loss streak
 input int      MinBarsForSignals      = 50;    // minimum bars required before allowing signals
 // (Adjusted later: default will be reduced to 3 in adaptive frequency changes)
 input bool     AllowLongs             = true;   // enable/disable long side
@@ -347,7 +361,7 @@ ulong rej_trend=0, rej_pullback=0, rej_structure=0, rej_momentum=0, rej_candle=0
 ulong rej_misc=0, rej_riskGate=0;
 
 // additional rejection counters
-ulong rej_space=0, rej_cooldown=0, rej_spreadDynamic=0, rej_side=0, rej_slope=0;
+ulong rej_space=0, rej_cooldown=0, rej_spreadDynamic=0, rej_side=0, rej_slope=0, rej_dayLossCap=0, rej_equityDD=0;
 
 // confirmation entry & structure break
 ulong    pendingTicket  = 0;
@@ -414,6 +428,8 @@ void DiagnosticsPrintSummary(){
          " Space=",rej_space,
          " Cooldown=",rej_cooldown,
          " DynSpread=",rej_spreadDynamic,
+         " DayLossCap=",rej_dayLossCap,
+         " EquityDD=",rej_equityDD,
          " Side=",rej_side,
          " Slope=",rej_slope,
          " RiskGate=",rej_riskGate);
@@ -435,11 +451,13 @@ void DiagnosticsCount(const string tag){
    else if(tag=="candle") rej_candle++;
    else if(tag=="extension") rej_extension++;
    else if(tag=="riskGate") rej_riskGate++;
-      else if(tag=="space") rej_space++;
-      else if(tag=="cooldown") rej_cooldown++;
-      else if(tag=="dynSpread") rej_spreadDynamic++;
-      else if(tag=="side") rej_side++;
-      else if(tag=="slope") rej_slope++;
+   else if(tag=="space") rej_space++;
+   else if(tag=="cooldown") rej_cooldown++;
+   else if(tag=="dynSpread") rej_spreadDynamic++;
+   else if(tag=="day-loss-cap") rej_dayLossCap++;
+   else if(tag=="equity-dd-cap") rej_equityDD++;
+   else if(tag=="side") rej_side++;
+   else if(tag=="slope") rej_slope++;
    else rej_misc++;
 }
 
@@ -652,8 +670,162 @@ void DayWeekIds(const datetime t, int &d_out, int &w_out){
 void ResetDailyCounters(){
    int dId, wId;
    DayWeekIds(TimeCurrent(), dId, wId);
-   if(gDayId!=dId){ gDayId=dId; gR_day=0.0; TradesToday=0; cooldownBarsRemaining=0; }
-   if(gWeekId!=wId){ gWeekId=wId; gR_week=0.0; }
+
+   // Day reset
+   if(gDayId!=dId){
+      gDayId=dId;
+      gR_day=0.0;
+      TradesToday=0;
+      dayLossCount=0;
+      consecutiveLosses=0;
+      cooldownBarsRemaining=0;
+      dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      R_today = 0.0;
+   }
+
+   // Week reset
+   if(gWeekId!=wId){
+      gWeekId=wId;
+      gR_week=0.0;
+      weekStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      R_week = 0.0;
+   }
+}
+
+bool DayLossCapBlocks(){
+   if(!DayLossCap_Enable) return false;
+   static int lockBars=0;
+   static bool grace=false;
+   static datetime graceStamp=0;
+
+   bool hit = (dayLossCount >= DayLossCap_MaxLosses) || (gR_day <= DayLossCap_MinR);
+   int idleBars = (gLastTradeTime>0)? int((TimeCurrent()-gLastTradeTime)/PeriodSeconds(PERIOD_M15)) : 9999;
+
+   if(grace){
+      if(gLastTradeTime>graceStamp){
+         grace=false;
+      } else {
+         return false;
+      }
+   }
+
+   if(hit){
+      if(lockBars==0 && Enable_Diagnostics)
+         PrintFormat("[Gate] Day loss cap hit: losses=%d R_day=%.2f threshold=%.2f", dayLossCount, gR_day, DayLossCap_MinR);
+      if(lockBars < DayLossCap_LockBars){ lockBars++; return true; }
+      if(idleBars >= DayLossCap_IdleUnlockBars){
+         if(Enable_Diagnostics) Print("[Gate] Day loss cap idle unlock");
+         lockBars=0;
+         grace=true;
+         graceStamp=TimeCurrent();
+         dayLossCount=0;
+         return false;
+      }
+      return true;
+   }
+   lockBars=0;
+   grace=false;
+   return false;
+}
+
+bool EquityDD_Gate(){
+   if(!DailyDD_Enable && !WeeklyDD_Enable) return false;
+   int idleBars = (gLastTradeTime>0)? int((TimeCurrent()-gLastTradeTime)/PeriodSeconds(PERIOD_M15)) : 9999;
+   static bool dayBlocking=false;
+   static bool weekBlocking=false;
+   static bool dailyGrace=false;
+   static datetime dailyGraceStamp=0;
+   static bool weeklyGrace=false;
+   static datetime weeklyGraceStamp=0;
+
+   bool blocked=false;
+
+   if(dailyGrace && gLastTradeTime>dailyGraceStamp) dailyGrace=false;
+   if(weeklyGrace && gLastTradeTime>weeklyGraceStamp) weeklyGrace=false;
+
+   if(DailyDD_Enable && dayStartEquity>0.0){
+      double dd = 100.0*(dayStartEquity-AccountInfoDouble(ACCOUNT_EQUITY))/dayStartEquity;
+      if(dd > DailyDD_MaxPct){
+         if(dailyGrace){
+            dayBlocking=false;
+         } else {
+            if(!dayBlocking && Enable_Diagnostics)
+               PrintFormat("[Gate] Daily DD cap: dd=%.2f%% max=%.2f idle=%d", dd, DailyDD_MaxPct, idleBars);
+            dayBlocking=true;
+            if(idleBars >= DD_IdleUnlockBars){
+               if(Enable_Diagnostics) Print("[Gate] Daily DD idle unlock");
+               dayBlocking=false;
+               dailyGrace=true;
+               dailyGraceStamp=TimeCurrent();
+            } else {
+               blocked=true;
+            }
+         }
+      } else {
+         dayBlocking=false;
+         dailyGrace=false;
+      }
+   } else {
+      dayBlocking=false;
+      dailyGrace=false;
+   }
+
+   if(WeeklyDD_Enable && weekStartEquity>0.0){
+      double dd = 100.0*(weekStartEquity-AccountInfoDouble(ACCOUNT_EQUITY))/weekStartEquity;
+      if(dd > WeeklyDD_MaxPct){
+         if(weeklyGrace){
+            weekBlocking=false;
+         } else {
+            if(!weekBlocking && Enable_Diagnostics)
+               PrintFormat("[Gate] Weekly DD cap: dd=%.2f%% max=%.2f idle=%d", dd, WeeklyDD_MaxPct, idleBars);
+            weekBlocking=true;
+            if(idleBars >= DD_IdleUnlockBars){
+               if(Enable_Diagnostics) Print("[Gate] Weekly DD idle unlock");
+               weekBlocking=false;
+               weeklyGrace=true;
+               weeklyGraceStamp=TimeCurrent();
+            } else {
+               blocked=true;
+            }
+         }
+      } else {
+         weekBlocking=false;
+         weeklyGrace=false;
+      }
+   } else {
+      weekBlocking=false;
+      weeklyGrace=false;
+   }
+
+   return blocked;
+}
+
+bool RiskGateBlocks(){
+   static bool probeGranted=false;
+   static bool wasBlocking=false;
+   if(!RiskGate_Enable){ probeGranted=false; riskGateProbeMode=false; wasBlocking=false; return false; }
+
+   bool hit = (TradesToday>0 && ((gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week)));
+   if(!hit){ probeGranted=false; riskGateProbeMode=false; wasBlocking=false; return false; }
+
+   int idleBars = (gLastTradeTime>0)? int((TimeCurrent()-gLastTradeTime)/PeriodSeconds(PERIOD_M15)) : 9999;
+   if(idleBars >= RiskGate_Unlock_NoTradeBars){
+      if(Enable_Diagnostics) Print("[Gate] Risk gate idle unlock");
+      probeGranted=false; riskGateProbeMode=false; wasBlocking=false; return false;
+   }
+
+   if(RiskGate_ProbeOnce && !probeGranted){
+      riskGateProbeMode = true;
+      probeGranted = true;
+      return false;
+   }
+
+   riskGateProbeMode = false;
+   DiagnosticsCount("riskGate");
+   if(!wasBlocking && Enable_Diagnostics)
+      PrintFormat("[Gate] Risk gate block: R_day=%.2f R_week=%.2f", gR_day, gR_week);
+   wasBlocking = true;
+   return true;
 }
 
 bool EquityFilterOK(){
@@ -893,11 +1065,13 @@ void PrintStageInfo(int stage){
 bool TryEnter_WithProbe(bool probe_mode){
    if(!probe_mode) return TryEnter();
    ResetDailyCounters();
-   if(RiskGate_Enable){
-      if(TradesToday>0 && ((gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week))){
-         DiagnosticsCount("riskGate");
-         return LogAndReturnFalse("budget-gate");
-      }
+   if(DayLossCapBlocks()){
+      DiagnosticsCount("day-loss-cap");
+      return LogAndReturnFalse("day-loss-cap");
+   }
+   if(EquityDD_Gate()){
+      DiagnosticsCount("equity-dd-cap");
+      return LogAndReturnFalse("equity-dd-cap");
    }
    // Probe: relax momentum (still trend-aligned), min lot, ATR*Probe_ATR_mult SL, TP=Probe_TP_R
    if(HasOpenPosition()) return false;
@@ -929,13 +1103,20 @@ bool TryEnter_WithProbe(bool probe_mode){
 }
 
 bool TryEnter(){
-   riskGateProbeMode = false;
-
-   // Hard unlocks/guards: never perma-lock due to risk caps
    ResetDailyCounters();
-
-   if(LossStreak_Protection && cooldownBarsRemaining>0)
+   if(LossStreak_Protection && cooldownBarsRemaining>0){
+      DiagnosticsCount("cooldown");
       return LogAndReturnFalse("cooldown");
+   }
+   if(DayLossCapBlocks()){
+      DiagnosticsCount("day-loss-cap");
+      return LogAndReturnFalse("day-loss-cap");
+   }
+   if(EquityDD_Gate()){
+      DiagnosticsCount("equity-dd-cap");
+      return LogAndReturnFalse("equity-dd-cap");
+   }
+   if(RiskGate_Enable && RiskGateBlocks())                return LogAndReturnFalse("risk-R-cap");
 
    string why="";
 
@@ -977,14 +1158,6 @@ bool TryEnter(){
    
    if(!SessionAllowed()) { AppendReason(why,"session"); return LogAndReturnFalse(why); }
    if(HasOpenPosition()) { AppendReason(why,"openPos"); return LogAndReturnFalse(why); }
-
-   if(RiskGate_Enable){
-      if(TradesToday>0 && ((gR_day <= RiskGate_MinR_Day) || (gR_week <= RiskGate_MinR_Week))){
-         if(Enable_Diagnostics) PrintFormat("[Gate] Risk gate block: R_today=%.2f R_week=%.2f", gR_day, gR_week);
-         DiagnosticsCount("riskGate");
-         return LogAndReturnFalse("budget-gate");
-      }
-   }
 
    double emaPull_1, emaStruct_1, emaFastH1, emaSlowH1;
    if(!GetValue(hEMA_M15_pull,0,1,emaPull_1) || !GetValue(hEMA_M15_struct,0,1,emaStruct_1) || !GetValue(hEMA_H1_fast,0,1,emaFastH1) || !GetValue(hEMA_H1_slow,0,1,emaSlowH1)) { AppendReason(why,"ema"); return LogAndReturnFalse(why); }
@@ -2092,6 +2265,9 @@ int OnInit(){
    dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    if(weekStartBalance<=0.0) weekStartBalance = dayStartBalance;
    MqlDateTime initDt; TimeCurrent(initDt); weekAnchorDayOfYear = initDt.day_of_year;
+   dayStartEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   weekStartEquity = dayStartEquity;
+   int _d,_w; DayWeekIds(TimeCurrent(),_d,_w); gDayId=_d; gWeekId=_w;
    dayLossCount = 0; quotaLossCount = 0;
    quotaPendingTicket = 0;
    quotaTradeActive = false;
@@ -2259,13 +2435,8 @@ void OnTick(){
       }
    }
 
-   bool newBar = NewM15Bar();
-   if(newBar){
-      // decrement cooldown once per M15 bar in all flows
-      if(LossStreak_Protection && cooldownBarsRemaining>0) cooldownBarsRemaining--;
-   } else {
-      return; // only evaluate entries once per new M15 bar
-   }
+   if(!NewM15Bar()) return; // only evaluate entries once per new M15 bar
+   if(LossStreak_Protection && cooldownBarsRemaining>0) cooldownBarsRemaining--;
    barsProcessed++; bool verboseBar = (Enable_Diagnostics && Verbose_First_N && (barsProcessed <= (ulong)Verbose_Bars_Limit));
    if(Diagnostics) PrintStageInfo(LoosenStage());
 
