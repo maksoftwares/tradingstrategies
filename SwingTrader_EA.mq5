@@ -226,9 +226,11 @@ input int    RiskGate_Unlock_NoTradeBars = 120; // idle unlock threshold (M15 ba
 input bool   RiskGate_ProbeOnce     = true;     // optional micro-probe after unlock
 input double RiskGate_ProbeLots     = 0.01;
 input double DayLossCap_R     = -2.50;  // was -3.00; cap per day by realized R
-input int    WinrateWindowN   = 20;     // min sample for equity/winrate gate
-input double WinrateMin       = 0.30;   // pause only if winrate < 30%
+input bool   WinrateGate_Enable = true;
+input int    WinrateWindowN   = 24;     // min sample for equity/winrate gate
+input double WinrateMin       = 0.33;   // pause only if winrate < 33%
 input int    WinrateCooldownBars = 48;  // cool-off, not whole day
+input int    Winrate_IdleUnlockBars = 64; // auto-unlock if idle this long
 input bool   Gate_ClosePositions = false; // gates block new entries only
 
 input group "=== Adaptive Frequency Layer ==="
@@ -315,6 +317,29 @@ int hADX = INVALID_HANDLE; // ADX for new entry flow
 CTrade trade;
 
 //--- state
+// --- winrate rolling window (bounded) ---
+#define WR_BUF_MAX 64
+int wrBuf[WR_BUF_MAX]; int wrHead=0; int wrSize=0; int wrWins=0; int wrLosses=0;
+void WR_Push(int outcome){ // outcome: 1=win, -1=loss, 0=flat
+   // remove oldest if full
+   if(wrSize==WR_BUF_MAX){
+      int old = wrBuf[wrHead];
+      if(old>0) wrWins--; else if(old<0) wrLosses--;
+      wrBuf[wrHead]=0; wrSize--; // will re-add below
+   }
+   // add new
+   wrBuf[wrHead] = outcome;
+   if(outcome>0) wrWins++; else if(outcome<0) wrLosses++;
+   wrSize++;
+   wrHead = (wrHead+1) % WR_BUF_MAX;
+}
+double WR_Value(){
+   int tot = wrWins + wrLosses;
+   if(tot<=0) return 1.0; // neutral if no data
+   double wr = (double)wrWins / (double)tot;
+   if(wr<0.0) wr=0.0; if(wr>1.0) wr=1.0;
+   return wr;
+}
 datetime lastM15BarTime = 0;
 bool     partialTaken   = false;
 bool     secondPartialTaken = false;
@@ -439,9 +464,9 @@ void DiagnosticsPrintSummary(){
          " Side=",rej_side,
          " Slope=",rej_slope,
          " RiskGate=",rej_riskGate);
-   PrintFormat("[Diag] Bars=%d DayLossCap=%d EquityDD=%d RiskGate=%d EqWinrate=%d R_day=%.2f R_week=%.2f",
+   PrintFormat("[Diag] Bars=%d DayLossCap=%d EquityDD=%d RiskGate=%d EqWinrate=%d NOENTRY(gate?) R_day=%.2f R_week=%.2f WR=%.2f samp=%d",
                barsProcessed, (int)rej_dayLossCap, (int)rej_equityDD, (int)rej_riskGate, (int)rej_equityGate,
-               gR_day, gR_week);
+               gR_day, gR_week, WR_Value(), (wrWins+wrLosses));
    Print(" [GateEq]", rej_equityGate, " [Probe]", probeEntries,
          " R_day=", DoubleToString(gR_day,2),
          " R_week=", DoubleToString(gR_week,2));
@@ -667,33 +692,28 @@ double NormalizePrice(double p){
    return NormalizeDouble(p,(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS));
 }
 
-// yyyymmdd and yyyyWW (coarse) without TimeDayOfYear dependency
+// yyyymmdd and yyyyWW(approx) without TimeDayOfYear (portable)
 void DayWeekIds(const datetime t, int &d_out, int &w_out){
    MqlDateTime dt; TimeToStruct(t, dt);
    d_out = dt.year*10000 + dt.mon*100 + dt.day;
    MqlDateTime jan1; jan1.year=dt.year; jan1.mon=1; jan1.day=1; jan1.hour=0; jan1.min=0; jan1.sec=0;
    const datetime d0 = StructToTime(jan1);
-   const int doy = int((t - d0)/86400) + 1;  // 1..366
+   const int doy = int((t - d0)/86400) + 1;
    w_out = dt.year*100 + (doy/7);
 }
 
 void ResetDailyCounters(){
-   int dId, wId;
-   DayWeekIds(TimeCurrent(), dId, wId);
-
-   // Day reset
+   int dId,wId; DayWeekIds(TimeCurrent(), dId, wId);
    if(gDayId!=dId){
       gDayId=dId;
-      gR_day=0.0;
-      TradesToday=0;
-      dayLossCount=0;
-      consecutiveLosses=0;
-      cooldownBarsRemaining=0;
+      gR_day=0.0; TradesToday=0;
+      dayLossCount=0; consecutiveLosses=0; cooldownBarsRemaining=0;
       dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
       R_today = 0.0;
+      // reset winrate buffer daily
+      wrHead=0; wrSize=0; wrWins=0; wrLosses=0;
+      for(int i=0;i<WR_BUF_MAX;i++) wrBuf[i]=0;
    }
-
-   // Week reset
    if(gWeekId!=wId){
       gWeekId=wId;
       gR_week=0.0;
@@ -744,36 +764,51 @@ bool DayLossCapBlocks(){
 
 // --- Winrate gate (blocks only if enough samples and below threshold) ---
 bool EquityWinrateGateActive(){
-   if(WinrateWindowN <= 0) return false;
-   int wins=0, total=0;
-   datetime t0 = TimeCurrent() - 86400*30;
-   if(HistorySelect(t0, TimeCurrent())){
-      int deals = (int)HistoryDealsTotal();
-      for(int i=deals-1; i>=0 && total<WinrateWindowN*2; --i){
-         ulong id = HistoryDealGetTicket(i);
-         if(!HistoryDealSelect(id)) continue;
-         if((ulong)HistoryDealGetInteger(id, DEAL_MAGIC)!=Magic) continue;
-         if(HistoryDealGetInteger(id, DEAL_ENTRY)!=DEAL_ENTRY_OUT) continue;
-         double p = HistoryDealGetDouble(id, DEAL_PROFIT)
-                  + HistoryDealGetDouble(id, DEAL_SWAP)
-                  + HistoryDealGetDouble(id, DEAL_COMMISSION);
-         total++;
-         if(p>0.0) wins++;
-         if(total>=WinrateWindowN) break;
-      }
-   }
-   if(total < WinrateWindowN) return false;              // not enough data
-   double wr = (double)wins / (double)total;
-   bool pause = (wr < WinrateMin);
+   if(!WinrateGate_Enable) return false;
+
+   // cooldown state
    static int wrCooldown=0;
-   if(pause){
-      if(wrCooldown==0 && Enable_Diagnostics)
-         Print("[Gate] Equity/winrate pause wr=", DoubleToString(wr,2), " < ", DoubleToString(WinrateMin,2));
-      wrCooldown = WinrateCooldownBars;
-   }else if(wrCooldown>0){
-      wrCooldown--;
+   static datetime wrCooldownLastBar=0;
+
+   // sample guard
+   int samples = wrWins + wrLosses;
+   if(samples < WinrateWindowN){
+      wrCooldown = 0;
+      wrCooldownLastBar = 0;
+      return false;
    }
-   return (wrCooldown>0);
+
+   // compute WR and idle bars
+   double wr = WR_Value();
+   int periodSec = (int)PeriodSeconds(PERIOD_M15);
+   if(periodSec<=0) periodSec=60;
+   int idleBars = (gLastTradeTime>0) ? int((TimeCurrent()-gLastTradeTime)/periodSec) : 9999;
+   datetime curBarTime = iTime(_Symbol, PERIOD_M15, 0);
+
+   // gate condition: only pause if WR low *and* we're in drawdown today or this week
+   bool inDrawdown = (gR_day < 0.0) || (gR_week < 0.0);
+   if(inDrawdown && wr < WinrateMin){
+      wrCooldown = WinrateCooldownBars;
+      wrCooldownLastBar = curBarTime;
+      if(Enable_Diagnostics)
+         PrintFormat("[Gate] eq/wr pause: WR=%.2f samples=%d R_day=%.2f R_week=%.2f",
+                     wr, samples, gR_day, gR_week);
+   }
+
+   if(wrCooldown>0){
+      if(curBarTime!=0){
+         if(curBarTime!=wrCooldownLastBar){
+            wrCooldown--;
+            wrCooldownLastBar = curBarTime;
+         }
+      }else{
+         wrCooldown--;
+      }
+      if(wrCooldown<0) wrCooldown=0;
+      if(idleBars >= Winrate_IdleUnlockBars) { wrCooldown=0; wrCooldownLastBar=0; return false; } // auto-unlock
+      return true; // block entries while cooling down
+   }
+   return false;
 }
 
 bool EquityDD_Gate(){
@@ -1113,6 +1148,10 @@ void PrintStageInfo(int stage){
 bool TryEnter_WithProbe(bool probe_mode){
    if(!probe_mode) return TryEnter();
    ResetDailyCounters();
+   if(LossStreak_Protection && cooldownBarsRemaining>0){
+      DiagnosticsCount("cooldown");
+      return LogAndReturnFalse("cooldown");
+   }
    if(RiskGate_Enable && gR_day <= DayLossCap_R){
       DiagnosticsCount("day-loss-cap");
       return LogAndReturnFalse("day-loss-cap");
@@ -1160,6 +1199,10 @@ bool TryEnter_WithProbe(bool probe_mode){
 
 bool TryEnter(){
    ResetDailyCounters();
+   if(LossStreak_Protection && cooldownBarsRemaining>0){
+      DiagnosticsCount("cooldown");
+      return LogAndReturnFalse("cooldown");
+   }
    if(RiskGate_Enable && gR_day <= DayLossCap_R){
       DiagnosticsCount("day-loss-cap");
       return LogAndReturnFalse("day-loss-cap");
@@ -1167,10 +1210,6 @@ bool TryEnter(){
    if(EquityWinrateGateActive()){
       DiagnosticsCount("eq-winrate-gate");
       return LogAndReturnFalse("eq-winrate-gate");
-   }
-   if(LossStreak_Protection && cooldownBarsRemaining>0){
-      DiagnosticsCount("cooldown");
-      return LogAndReturnFalse("cooldown");
    }
    if(DayLossCapBlocks()){
       DiagnosticsCount("day-loss-cap");
@@ -2449,8 +2488,11 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
    bool win   = (profit > 0.0);
    UpdateSidePerformance(isBuy, win);
 
-   double outcome = (profit>0.0 ? 1.0 : (profit<0.0 ? -1.0 : 0.0));
-   recentWinsLosses[rwlIndex] = outcome;
+   int outcome = (profit>0.0 ? 1 : (profit<0.0 ? -1 : 0));
+   WR_Push(outcome);
+
+   double outcomeRwl = (profit>0.0 ? 1.0 : (profit<0.0 ? -1.0 : 0.0));
+   recentWinsLosses[rwlIndex] = outcomeRwl;
    rwlIndex = (rwlIndex+1) % 32;
    rwlCount = (int)MathMin(rwlCount+1,32);
    if(profit < 0.0){
@@ -2502,6 +2544,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
 void OnTick(){
    ResetDailyCounters();
    ResetRiskWindowsIfNeeded();
+   bool eqGateNow = EquityWinrateGateActive();
    double eqNow = AccountInfoDouble(ACCOUNT_EQUITY);
    if(peak_equity <= 0.0) peak_equity = eqNow;
    if(eqNow > peak_equity) peak_equity = eqNow;
@@ -2511,6 +2554,21 @@ void OnTick(){
    if(_weekId != lastWeekId) { lastWeekId = _weekId; weekStartEquity = AccountInfoDouble(ACCOUNT_EQUITY); }
    // manage open trade each tick
    ManagePartialAndTrail();
+
+   // If a gate is active, ensure no pending orders remain
+   if((RiskGate_Enable && gR_day <= DayLossCap_R) || eqGateNow){
+      for(int i=OrdersTotal()-1;i>=0;--i){
+         if(!OrderSelect(i, SELECT_BY_POS)) continue;
+         ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         if(type!=ORDER_TYPE_BUY_STOP && type!=ORDER_TYPE_SELL_STOP && type!=ORDER_TYPE_BUY_LIMIT && type!=ORDER_TYPE_SELL_LIMIT) continue;
+         if((ulong)OrderGetInteger(ORDER_MAGIC) != Magic) continue;
+         if(OrderGetInteger(ORDER_STATE)==ORDER_STATE_PLACED){
+            MqlTradeRequest rr; MqlTradeResult rres; ZeroMemory(rr); ZeroMemory(rres);
+            rr.action=TRADE_ACTION_REMOVE; rr.order=OrderGetInteger(ORDER_TICKET);
+            OrderSend(rr,rres);
+         }
+      }
+   }
 
    // detect pending order filled (reset tracking variables)
    if(pendingTicket>0){
@@ -2531,7 +2589,7 @@ void OnTick(){
       if(Enable_Diagnostics && Diagnostics_Every_Bars>0 && (barsProcessed % (ulong)Diagnostics_Every_Bars)==0) DiagnosticsPrintSummary();
       return;
    }
-   if(EquityWinrateGateActive()){
+   if(eqGateNow){
       DiagnosticsCount("eq-winrate-gate");
       if(Enable_Diagnostics) Print("[Gate] Equity/winrate gate active (tick)");
       if(Enable_Diagnostics && Diagnostics_Every_Bars>0 && (barsProcessed % (ulong)Diagnostics_Every_Bars)==0) DiagnosticsPrintSummary();
