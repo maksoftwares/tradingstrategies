@@ -95,6 +95,7 @@ input bool     Use_Time_Exit   = true;     // exit stale trades
 input int      Max_Bars_In_Trade = 96;     // close if trade exceeds this many M15 bars (~24h)
 input bool     Use_Vol_Compress_Exit = true; // exit if volatility collapses
 input double   Vol_Compress_Ratio = 0.65;  // ATR(now)/ATR(entry) below => exit if not reached 0.5R
+input int      MinBarsBeforeExit = 4; // do not evaluate time/vol exits until N bars after fill
 
 input group "=== Risk Caps & Probes ==="
 input bool   Enable_RiskCaps          = false;   // enable budget caps
@@ -224,6 +225,11 @@ input double RiskGate_MinR_Week     = -6.5;     // lock until new week if <= thi
 input int    RiskGate_Unlock_NoTradeBars = 120; // idle unlock threshold (M15 bars)
 input bool   RiskGate_ProbeOnce     = true;     // optional micro-probe after unlock
 input double RiskGate_ProbeLots     = 0.01;
+input double DayLossCap_R     = -2.50;  // was -3.00; cap per day by realized R
+input int    WinrateWindowN   = 20;     // min sample for equity/winrate gate
+input double WinrateMin       = 0.30;   // pause only if winrate < 30%
+input int    WinrateCooldownBars = 48;  // cool-off, not whole day
+input bool   Gate_ClosePositions = false; // gates block new entries only
 
 input group "=== Adaptive Frequency Layer ==="
 input bool   AdaptiveLoosen     = true;  // enable dynamic threshold loosening intraday
@@ -232,13 +238,13 @@ input int    LoosenHour1        = 12;    // first relax hour (server time)
 input int    LoosenHour2        = 16;    // second relax hour
 input int    ADX_Min_L0         = 18;    // base strict
 input int    ADX_Min_L1         = 16;    // first relax
-input int    ADX_Min_L2         = 14;    // second relax
+input int    ADX_Min_L2         = 12;    // second relax
 input double CI_Max_L0          = 50.0;  // compression index max stage 0
 input double CI_Max_L1          = 60.0;  // compression index max stage 1
 input double CI_Max_L2          = 70.0;  // compression index max stage 2
 input double MinSpace_ATR_L0    = 0.30;   // structure space stage 0
 input double MinSpace_ATR_L1    = 0.25;   // structure space stage 1
-input double MinSpace_ATR_L2    = 0.15;   // structure space stage 2
+input double MinSpace_ATR_L2    = 0.20;   // structure space stage 2
 input int    RSI_Mid_L2         = 49;    // slightly easier RSI midline at stage 2
 
 input group "=== Equity Gate & Probe Lane ==="
@@ -433,6 +439,9 @@ void DiagnosticsPrintSummary(){
          " Side=",rej_side,
          " Slope=",rej_slope,
          " RiskGate=",rej_riskGate);
+   PrintFormat("[Diag] Bars=%d DayLossCap=%d EquityDD=%d RiskGate=%d EqWinrate=%d R_day=%.2f R_week=%.2f",
+               barsProcessed, (int)rej_dayLossCap, (int)rej_equityDD, (int)rej_riskGate, (int)rej_equityGate,
+               gR_day, gR_week);
    Print(" [GateEq]", rej_equityGate, " [Probe]", probeEntries,
          " R_day=", DoubleToString(gR_day,2),
          " R_week=", DoubleToString(gR_week,2));
@@ -451,6 +460,7 @@ void DiagnosticsCount(const string tag){
    else if(tag=="candle") rej_candle++;
    else if(tag=="extension") rej_extension++;
    else if(tag=="riskGate") rej_riskGate++;
+   else if(tag=="eq-winrate-gate") rej_equityGate++;
    else if(tag=="space") rej_space++;
    else if(tag=="cooldown") rej_cooldown++;
    else if(tag=="dynSpread") rej_spreadDynamic++;
@@ -693,6 +703,10 @@ void ResetDailyCounters(){
 }
 
 bool DayLossCapBlocks(){
+   if(RiskGate_Enable && gR_day <= DayLossCap_R){
+      if(Enable_Diagnostics) Print("[Gate] Day loss cap hit: R_day=", DoubleToString(gR_day,2), " threshold=", DoubleToString(DayLossCap_R,2));
+      return true;
+   }
    if(!DayLossCap_Enable) return false;
    static int lockBars=0;
    static bool grace=false;
@@ -726,6 +740,40 @@ bool DayLossCapBlocks(){
    lockBars=0;
    grace=false;
    return false;
+}
+
+// --- Winrate gate (blocks only if enough samples and below threshold) ---
+bool EquityWinrateGateActive(){
+   if(WinrateWindowN <= 0) return false;
+   int wins=0, total=0;
+   datetime t0 = TimeCurrent() - 86400*30;
+   if(HistorySelect(t0, TimeCurrent())){
+      int deals = (int)HistoryDealsTotal();
+      for(int i=deals-1; i>=0 && total<WinrateWindowN*2; --i){
+         ulong id = HistoryDealGetTicket(i);
+         if(!HistoryDealSelect(id)) continue;
+         if((ulong)HistoryDealGetInteger(id, DEAL_MAGIC)!=Magic) continue;
+         if(HistoryDealGetInteger(id, DEAL_ENTRY)!=DEAL_ENTRY_OUT) continue;
+         double p = HistoryDealGetDouble(id, DEAL_PROFIT)
+                  + HistoryDealGetDouble(id, DEAL_SWAP)
+                  + HistoryDealGetDouble(id, DEAL_COMMISSION);
+         total++;
+         if(p>0.0) wins++;
+         if(total>=WinrateWindowN) break;
+      }
+   }
+   if(total < WinrateWindowN) return false;              // not enough data
+   double wr = (double)wins / (double)total;
+   bool pause = (wr < WinrateMin);
+   static int wrCooldown=0;
+   if(pause){
+      if(wrCooldown==0 && Enable_Diagnostics)
+         Print("[Gate] Equity/winrate pause wr=", DoubleToString(wr,2), " < ", DoubleToString(WinrateMin,2));
+      wrCooldown = WinrateCooldownBars;
+   }else if(wrCooldown>0){
+      wrCooldown--;
+   }
+   return (wrCooldown>0);
 }
 
 bool EquityDD_Gate(){
@@ -1065,6 +1113,14 @@ void PrintStageInfo(int stage){
 bool TryEnter_WithProbe(bool probe_mode){
    if(!probe_mode) return TryEnter();
    ResetDailyCounters();
+   if(RiskGate_Enable && gR_day <= DayLossCap_R){
+      DiagnosticsCount("day-loss-cap");
+      return LogAndReturnFalse("day-loss-cap");
+   }
+   if(EquityWinrateGateActive()){
+      DiagnosticsCount("eq-winrate-gate");
+      return LogAndReturnFalse("eq-winrate-gate");
+   }
    if(DayLossCapBlocks()){
       DiagnosticsCount("day-loss-cap");
       return LogAndReturnFalse("day-loss-cap");
@@ -1104,6 +1160,14 @@ bool TryEnter_WithProbe(bool probe_mode){
 
 bool TryEnter(){
    ResetDailyCounters();
+   if(RiskGate_Enable && gR_day <= DayLossCap_R){
+      DiagnosticsCount("day-loss-cap");
+      return LogAndReturnFalse("day-loss-cap");
+   }
+   if(EquityWinrateGateActive()){
+      DiagnosticsCount("eq-winrate-gate");
+      return LogAndReturnFalse("eq-winrate-gate");
+   }
    if(LossStreak_Protection && cooldownBarsRemaining>0){
       DiagnosticsCount("cooldown");
       return LogAndReturnFalse("cooldown");
@@ -1141,15 +1205,16 @@ bool TryEnter(){
    // --- Data prerequisites ---
    MqlRates m15[3];
    if(!GetRates(PERIOD_M15,3,m15)) { AppendReason(why,"rates"); return LogAndReturnFalse(why); }
+   int stage = LoosenStage();
    double body = MathAbs(m15[1].close - m15[1].open);
    double range= (m15[1].high - m15[1].low);
-   bool   bodyOK = (range>0 && (body/range) >= 0.25);
+   double bodyFrac = (range>0 ? body/range : 0.0);
+   bool   bodyOK = (bodyFrac >= (stage>0 ? 0.25 : 0.30)); // stage-2 a bit looser
    if(!bodyOK) { AppendReason(why,"weakBody"); return LogAndReturnFalse(why); }
    double atr;
    if(!GetValue(hATR_M15,0,1,atr)) { AppendReason(why,"atr"); return LogAndReturnFalse(why); }
-   
+
    // Spread check: stage 2 can optionally bypass
-   int stage = LoosenStage();
    if(!(Stage2_IgnoresSpread && stage==2)){
       if(!SpreadOK_Dynamic(atr)) { AppendReason(why,"spread>cap"); return LogAndReturnFalse(why); }
    } else if(Diagnostics) {
@@ -1172,14 +1237,15 @@ bool TryEnter(){
    double macd_curr, macd_prev, rsi_curr, rsi_prev;
    if(!GetValue(hMACD_M15,0,1,macd_curr) || !GetValue(hMACD_M15,0,2,macd_prev) || !GetValue(hRSI_M15,0,1,rsi_curr) || !GetValue(hRSI_M15,0,2,rsi_prev)) { AppendReason(why,"momData"); return LogAndReturnFalse(why); }
 
-   stage = LoosenStage();
    bool failSafeActive = (stage>0 && TradesToday < DailyMinTrades);
    bool allowLongManual = AllowLongs;
    bool allowShortManual = AllowShorts;
    bool allowLongSide = allowLongManual;
    bool allowShortSide = allowShortManual;
-   if(!AllowLongsAuto) allowLongSide=false;
-   if(!AllowShortsAuto) allowShortSide=false;
+   if(stage==0){
+      if(!AllowLongsAuto) allowLongSide=false;
+      if(!AllowShortsAuto) allowShortSide=false;
+   }
    bool macdUp = (macd_prev<=0 && macd_curr>0);
    bool macdDown=(macd_prev>=0 && macd_curr<0);
    bool rsiUp = (rsi_prev<50 && rsi_curr>50);
@@ -1263,7 +1329,7 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
    if(!canLong && !canShort){
       if(!allowLongSide){
          if(!allowLongManual) AppendReason(why,"longDisabled");
-         else if(!AllowLongsAuto) AppendReason(why,"longAutoGuard");
+         else if(stage==0 && !AllowLongsAuto) AppendReason(why,"longAutoGuard");
       }
       if(!trendUp) AppendReason(why,"noTrendLong");
       if(!longMomentum) AppendReason(why,"noMomLong");
@@ -1274,7 +1340,7 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
       if(!ciOK) AppendReason(why,"ci");
       if(!allowShortSide){
          if(!allowShortManual) AppendReason(why,"shortDisabled");
-         else if(!AllowShortsAuto) AppendReason(why,"shortAutoGuard");
+         else if(stage==0 && !AllowShortsAuto) AppendReason(why,"shortAutoGuard");
       }
       if(!trendDown) AppendReason(why,"noTrendShort");
       if(!shortMomentum) AppendReason(why,"noMomShort");
@@ -1971,6 +2037,14 @@ void ManagePartialAndTrail(){
    if(!PositionSelect(_Symbol)) { partialTaken=false; secondPartialTaken=false; probeBarsSinceEntry=0; probeStopPts=0.0; lastBarCountTime=0; return; }
    if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic){ lastBarCountTime=0; return; }
 
+   if(entryTime>0){
+      int periodSec = PeriodSeconds(PERIOD_M15);
+      if(periodSec>0){
+         int barsHeld = (int)((TimeCurrent() - entryTime) / periodSec);
+         if(barsHeld < MinBarsBeforeExit) return;
+      }
+   }
+
    probeBarsSinceEntry++;
    if(probeStopPts>0 && probeBarsSinceEntry<=Probe_EarlyAbort_Bars){
       long t = (long)PositionGetInteger(POSITION_TYPE);
@@ -2307,16 +2381,23 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
    ulong  ticket    = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
 
    if(entryType == DEAL_ENTRY_IN){
-      double sl       = HistoryDealGetDouble(trans.deal, DEAL_SL);
-      double price    = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
-      double tickValue= SymbolInfoDouble(sym,SYMBOL_TRADE_TICK_VALUE);
-      double tickSize = SymbolInfoDouble(sym,SYMBOL_TRADE_TICK_SIZE);
-      double riskMoney= 0.0;
-      if(volume>0.0 && sl>0.0 && tickSize>0.0 && tickValue>0.0){
-         double ticks = MathAbs(price-sl) / tickSize;
-         riskMoney = MathMax(0.01, ticks * tickValue * volume);
+      double sl    = HistoryDealGetDouble(trans.deal, DEAL_SL);
+      double price = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+      double riskMoney = 0.0;
+
+      if(volume>0.0 && sl>0.0){
+         double pl=0.0;
+         long dealType = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+         // Use OrderCalcProfit so symbol/contract settings are handled by MT5
+         ENUM_ORDER_TYPE closeSide = (dealType==DEAL_TYPE_BUY ? ORDER_TYPE_SELL : ORDER_TYPE_BUY);
+         if(OrderCalcProfit(closeSide, HistoryDealGetString(trans.deal, DEAL_SYMBOL), volume, price, sl, pl))
+            riskMoney = MathAbs(pl);
       }
-      if(riskMoney>0.0) RiskMapPut(ticket, riskMoney);
+      if(riskMoney<=0.0){
+         // Fallback: use %risk of balance if SL missing/zero
+         riskMoney = MathMax(0.01, AccountInfoDouble(ACCOUNT_BALANCE)*(Risk_Percent/100.0));
+      }
+      RiskMapPut(ticket, riskMoney);
 
       activeTradeRiskCash = riskMoney;
       activeTradeOneRCashPerLot = (volume>0.0 ? (riskMoney/MathMax(volume,1e-9)) : 0.0);
@@ -2325,7 +2406,6 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
       activeTradePositionId = ticket;
 
       gLastTradeTime = TimeCurrent();
-
       TradesToday++;
       barsSinceEntry = 0;
       lastEntryStopPts = entryStopPoints;
@@ -2338,6 +2418,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
          quotaPendingTicket = 0;
       } else {
          quotaTradeActive = commentQuota;
+         quotaPendingTicket = 0;
       }
       return;
    }
@@ -2351,6 +2432,10 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
    if(riskMoney<=0.0)
       riskMoney = MathMax(0.01, AccountInfoDouble(ACCOUNT_BALANCE)*(Risk_Percent/100.0));
    double r = (riskMoney>0.0 ? profit / riskMoney : 0.0);
+   // Safety clamps to prevent runaway gates if broker values momentarily misreport
+   if(!MathIsValidNumber(r) || !MathIsValidNumber(profit)) r = 0.0;
+   if(r >  5.0) r =  5.0;
+   if(r < -5.0) r = -5.0;
    if(IsFiniteD(r)){
       gR_day += r;
       gR_week += r;
@@ -2440,6 +2525,19 @@ void OnTick(){
    barsProcessed++; bool verboseBar = (Enable_Diagnostics && Verbose_First_N && (barsProcessed <= (ulong)Verbose_Bars_Limit));
    if(Diagnostics) PrintStageInfo(LoosenStage());
 
+   if(RiskGate_Enable && gR_day <= DayLossCap_R){
+      DiagnosticsCount("day-loss-cap");
+      if(Enable_Diagnostics) Print("[Gate] Day loss cap block (tick) R_day=", DoubleToString(gR_day,2), " <= ", DoubleToString(DayLossCap_R,2));
+      if(Enable_Diagnostics && Diagnostics_Every_Bars>0 && (barsProcessed % (ulong)Diagnostics_Every_Bars)==0) DiagnosticsPrintSummary();
+      return;
+   }
+   if(EquityWinrateGateActive()){
+      DiagnosticsCount("eq-winrate-gate");
+      if(Enable_Diagnostics) Print("[Gate] Equity/winrate gate active (tick)");
+      if(Enable_Diagnostics && Diagnostics_Every_Bars>0 && (barsProcessed % (ulong)Diagnostics_Every_Bars)==0) DiagnosticsPrintSummary();
+      return;
+   }
+
    bool probeMode=false;
    if(!CapsAllowTrading(probeMode)){
       if(Enable_Diagnostics) Print("[Gate] Risk cap active: R_today=",DoubleToString(R_today,2)," R_week=",DoubleToString(R_week,2));
@@ -2491,8 +2589,8 @@ void OnTick(){
 
    int stageLegacy = LoosenStage();
    bool failSafeLegacy = (stageLegacy>0 && TradesToday < DailyMinTrades);
-   bool allowLongSide = (AllowLongs && AllowLongsAuto);
-   bool allowShortSide = (AllowShorts && AllowShortsAuto);
+   bool allowLongSide = AllowLongs && (stageLegacy==0 ? AllowLongsAuto : true);
+   bool allowShortSide = AllowShorts && (stageLegacy==0 ? AllowShortsAuto : true);
 
    // trend determination
    bool trendUp = (emaH1_fast_1 > emaH1_slow_1);
