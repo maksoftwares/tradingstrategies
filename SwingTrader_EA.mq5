@@ -47,6 +47,25 @@ void CloseAllEAPositions(const string reason=""){
    }
 }
 
+// Flatten EA positions by reversing trade direction (used by kill switch safeguards)
+void FlattenEAPositions(){
+   for(int p=PositionsTotal()-1; p>=0; --p){
+      if(!PositionSelectByIndex(p)) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
+      string sym = PositionGetString(POSITION_SYMBOL);
+      long   type = (long)PositionGetInteger(POSITION_TYPE);
+      double vol  = PositionGetDouble(POSITION_VOLUME);
+      if(vol<=0.0) continue;
+
+      trade.SetExpertMagicNumber(Magic);
+      if(type==POSITION_TYPE_BUY){
+         trade.Sell(vol, sym);
+      }else if(type==POSITION_TYPE_SELL){
+         trade.Buy(vol, sym);
+      }
+   }
+}
+
 // recompute realized R from history since 'sinceTs' (closed deals only)
 double ComputeRealizedR(const datetime sinceTs,const int maxDeals=500){
    double sumR=0.0;
@@ -2667,18 +2686,7 @@ void OnTick(){
          {
             if(Enable_Diagnostics)
                Print("[FailSafe] Peak-DD hard stop hit: ", DoubleToString(ddFromPeakPct,2), "%");
-            for(int p=PositionsTotal()-1; p>=0; --p)
-            {
-               if(!PositionSelectByIndex(p)) continue;
-               if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
-               string sym = PositionGetString(POSITION_SYMBOL);
-               long   t   = (long)PositionGetInteger(POSITION_TYPE);
-               double v   = PositionGetDouble(POSITION_VOLUME);
-               if(v<=0.0) continue;
-               trade.SetExpertMagicNumber(Magic);
-               if(t==POSITION_TYPE_BUY)  trade.Sell(v, sym);
-               else                      trade.Buy(v, sym);
-            }
+            FlattenEAPositions();
          }
          cooldownBarsRemaining = DayLossCap_LockBars; // pause for rest of the day
          gPeakHardStopActive = true;
