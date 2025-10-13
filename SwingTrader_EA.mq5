@@ -38,37 +38,6 @@ datetime g_equity_peak_ts = 0;
 // ---- Compile-safe math helper (no MathIsFinite dependency) ----
 inline bool IsFiniteD(const double x){ return (x==x) && (x<1e308) && (x>-1e308); }
 
-// ---- Orders compatibility helpers (works on all MQL5 builds) ----
-ulong OrderGetTicketCompat(const int index){
-#ifdef __MQL5__
-   return OrderGetTicket(index);
-#else
-   return 0;
-#endif
-}
-
-bool CancelPendingByTicket(const ulong ticket, const ulong magic){
-   if(ticket==0) return false;
-   if(!OrderSelect(ticket)) return false;
-   if((ulong)OrderGetInteger(ORDER_MAGIC)!=magic) return false;
-
-   const ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-   const bool isPending =
-      (type==ORDER_TYPE_BUY_LIMIT || type==ORDER_TYPE_SELL_LIMIT ||
-       type==ORDER_TYPE_BUY_STOP  || type==ORDER_TYPE_SELL_STOP);
-   if(!isPending) return false;
-
-   const ENUM_ORDER_STATE state = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
-   if(state!=ORDER_STATE_PLACED && state!=ORDER_STATE_STARTED) return false;
-
-   trade.SetExpertMagicNumber(magic);
-   if(trade.OrderDelete(ticket)) return true;
-
-   MqlTradeRequest rq; MqlTradeResult rr; ZeroMemory(rq); ZeroMemory(rr);
-   rq.action = TRADE_ACTION_REMOVE; rq.order = ticket;
-   return OrderSend(rq, rr);
-}
-
 bool PositionSelectByIndexCompat(const int index){
 #ifdef __MQL5__
    const ulong posTicket = PositionGetTicket(index);
@@ -102,11 +71,20 @@ bool GateActive(bool &eqGateOut, bool &dayGateOut, bool &wrGateOut,
 
 void CleanupPendingsIfGatedCompat(const bool gateNow, const ulong magic){
    if(!gateNow || !CancelPendings_WhenGated) return;
-   const int total = (int)OrdersTotal();
-   for(int i=total-1; i>=0; --i){
-      const ulong ticket = OrderGetTicketCompat(i);
-      if(ticket==0) continue;
-      CancelPendingByTicket(ticket, magic);
+   for(int i=OrdersTotal()-1; i>=0; --i){
+      if(!OrderSelectByIndex(i)) continue;
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != magic) continue;
+
+      ENUM_ORDER_TYPE typ = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      bool isPending = (typ==ORDER_TYPE_BUY_LIMIT || typ==ORDER_TYPE_SELL_LIMIT ||
+                        typ==ORDER_TYPE_BUY_STOP  || typ==ORDER_TYPE_SELL_STOP);
+      if(!isPending) continue;
+
+      ENUM_ORDER_STATE st = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
+      if(st!=ORDER_STATE_PLACED && st!=ORDER_STATE_STARTED) continue;
+
+      ulong ticket = (ulong)OrderGetInteger(ORDER_TICKET);
+      if(ticket>0) trade.OrderDelete(ticket);
    }
 }
 
@@ -177,7 +155,7 @@ input int      MinBarsBeforeExit = 4; // do not evaluate time/vol exits until N 
 
 input group "=== Risk Caps & Probes ==="
 input bool   Enable_RiskCaps          = true;    // enable budget caps
-input double Risk_Percent_Base        = 0.45;    // base % risk per trade (0.45%)
+input double Risk_Percent_Base        = 0.60;    // base % risk per trade (0.60%)
 input double DailyLossCap_R           = 1.8;     // stop trading for the day if net closed loss <= -1.8R
 input double WeeklyLossCap_R          = 4.0;     // stop trading for the week if net closed loss <= -4R
 input bool   Allow_Probe_When_Capped  = true;    // still allow micro lot probe trades under caps
@@ -314,7 +292,7 @@ input bool   Gate_ClosePositions = true;  // optionally flatten open trades when
 // -------- Peak-DD kill switch & cumulative-risk guard --------
 input double PeakDD_HardStopPct      = 28.0;   // flatten + disable day if peak DD exceeds
 input double PeakDD_SoftThrottlePct  = 12.0;   // throttle risk beyond this DD from peak
-input double Max_Open_Risk_R         = 1.8;    // sum of open risks (in R), block new trades if exceeded
+input double Max_Open_Risk_R         = 2.2;    // sum of open risks (in R), block new trades if exceeded
 
 input group "=== Adaptive Frequency Layer ==="
 input bool   AdaptiveLoosen     = true;  // enable dynamic threshold loosening intraday
@@ -1403,39 +1381,12 @@ bool TryEnter(){
    }
    if(RiskGate_Enable && RiskGateBlocks())                return LogAndReturnFalse("risk-R-cap");
 
-   double totalOpenR = 0.0;
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double pctPerTrade = (gEffectiveRiskPct>0.0?gEffectiveRiskPct:Risk_Percent);
-   double perTradeRisk = balance * (pctPerTrade/100.0);
-   for(int p=PositionsTotal()-1; p>=0; --p){
-      if(!PositionSelectByIndexCompat(p)) continue;
-      if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
-      double vol = PositionGetDouble(POSITION_VOLUME);
-      double sl = PositionGetDouble(POSITION_SL);
-      if(vol<=0.0) continue;
-      if(sl<=0.0){
-         totalOpenR += 1.0;
-         continue;
+   double openR = OpenRiskR();
+   if(openR >= Max_Open_Risk_R){
+      if(Enable_Diagnostics){
+         PrintFormat("[Gate] cumulative open risk R=%.2f >= %.2f (1R=%.2f cash)",
+                     openR, Max_Open_Risk_R, OneRCashNow());
       }
-      ulong posTicket = (ulong)PositionGetInteger(POSITION_TICKET);
-      double riskCash = RiskMapGet(posTicket);
-      if(riskCash<=0.0){
-         string sym = PositionGetString(POSITION_SYMBOL);
-         double open = PositionGetDouble(POSITION_PRICE_OPEN);
-         double loss=0.0;
-         ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-         ENUM_ORDER_TYPE closeSide = (ptype==POSITION_TYPE_BUY?ORDER_TYPE_SELL:ORDER_TYPE_BUY);
-         if(OrderCalcProfit(closeSide, sym, vol, open, sl, loss))
-            riskCash = MathAbs(loss);
-      }
-      if(riskCash<=0.0) continue;
-      double riskR = (perTradeRisk>0.0 ? riskCash / perTradeRisk : 0.0);
-      if(riskR<=0.0) riskR = 1.0;
-      totalOpenR += MathAbs(riskR);
-   }
-   if(totalOpenR >= Max_Open_Risk_R){
-      if(Enable_Diagnostics)
-         PrintFormat("[Gate] cumulative open risk R=%.2f >= %.2f", totalOpenR, Max_Open_Risk_R);
       return LogAndReturnFalse("risk-cumulative");
    }
 
@@ -2010,6 +1961,77 @@ bool SafeOrderSend(MqlTradeRequest &rq, MqlTradeResult &rs)
       }
    }
    return OrderSend(rq, rs);
+}
+
+// Cash value of 1R at current balance
+double OneRCashNow(){
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double pct = (Risk_Percent_Base>0.0 ? Risk_Percent_Base : Risk_Percent);
+   double oneR = bal * (pct/100.0);
+   return (oneR>0.0 ? oneR : 1.0);
+}
+
+// Sum of current open risk across our positions + pendings, expressed in R (not points!)
+double OpenRiskR(){
+   double rSum = 0.0;
+   const double oneR = OneRCashNow();
+
+   // --- live positions (our Magic only)
+   for(int i=PositionsTotal()-1; i>=0; --i){
+      if(!PositionSelectByIndex(i)) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != Magic) continue;
+
+      string sym  = PositionGetString(POSITION_SYMBOL);
+      double vol  = PositionGetDouble(POSITION_VOLUME);
+      double sl   = PositionGetDouble(POSITION_SL);
+      double open = PositionGetDouble(POSITION_PRICE_OPEN);
+      long   typ  = (long)PositionGetInteger(POSITION_TYPE);
+      if(vol<=0.0 || sl<=0.0 || open<=0.0) continue;
+
+      // if SL is on the safe side (BE or better), risk is zero
+      if((typ==POSITION_TYPE_BUY  && sl>=open) ||
+         (typ==POSITION_TYPE_SELL && sl<=open)) continue;
+
+      double tick_val = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+      double tick_sz  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+      if(tick_sz<=0.0 || tick_val<=0.0) continue;
+
+      double ticks     = MathAbs(open - sl) / tick_sz;
+      double riskMoney = ticks * tick_val * vol;
+      rSum += riskMoney / oneR;
+   }
+
+   // --- pending orders (calculate using order price & SL)
+   for(int j=OrdersTotal()-1; j>=0; --j){
+      if(!OrderSelectByIndex(j)) continue;
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != Magic) continue;
+
+      ENUM_ORDER_TYPE typ = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(typ!=ORDER_TYPE_BUY_STOP  && typ!=ORDER_TYPE_SELL_STOP &&
+         typ!=ORDER_TYPE_BUY_LIMIT && typ!=ORDER_TYPE_SELL_LIMIT) continue;
+
+      string sym  = OrderGetString(ORDER_SYMBOL);
+      double vol  = OrderGetDouble(ORDER_VOLUME_CURRENT);
+      double sl   = OrderGetDouble(ORDER_SL);
+      double px   = OrderGetDouble(ORDER_PRICE_OPEN);
+      if(vol<=0.0 || sl<=0.0 || px<=0.0) continue;
+
+      // only count risk if SL is actually on the risky side
+      if((typ==ORDER_TYPE_BUY_STOP  || typ==ORDER_TYPE_BUY_LIMIT)  && sl>=px) continue;
+      if((typ==ORDER_TYPE_SELL_STOP || typ==ORDER_TYPE_SELL_LIMIT) && sl<=px) continue;
+
+      double tick_val = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+      double tick_sz  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+      if(tick_sz<=0.0 || tick_val<=0.0) continue;
+
+      double ticks     = MathAbs(px - sl) / tick_sz;
+      double riskMoney = ticks * tick_val * vol;
+      rSum += riskMoney / oneR;
+   }
+
+   // guard against NaN/inf
+   if(!(rSum==rSum) || rSum<0.0) rSum = 0.0;
+   return rSum;
 }
 
 double LotsFromRisk(double stop_points){
