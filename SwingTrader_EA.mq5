@@ -33,69 +33,6 @@ void RiskMapPut(ulong t,double m){ for(int i=0;i<gOpenCount;i++) if(gOpenTicket[
 double RiskMapGet(ulong t){ for(int i=0;i<gOpenCount;i++){ if(gOpenTicket[i]==t) return gOpenRiskMoney[i]; } return 0.0; }
 double RiskMapPop(ulong t){ for(int i=0;i<gOpenCount;i++){ if(gOpenTicket[i]==t){ double v=gOpenRiskMoney[i]; gOpenCount--; gOpenTicket[i]=gOpenTicket[gOpenCount]; gOpenRiskMoney[i]=gOpenRiskMoney[gOpenCount]; return v; } } return 0.0; }
 
-void CloseAllEAPositions(const string reason=""){
-   for(int i=PositionsTotal()-1; i>=0; --i){
-      if(!PositionSelectByIndex(i)) continue;
-      if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
-      string sym = PositionGetString(POSITION_SYMBOL);
-      double vol = PositionGetDouble(POSITION_VOLUME);
-      if(vol<=0.0) continue;
-      trade.SetExpertMagicNumber(Magic);
-      if(!trade.PositionClose(sym) && Enable_Diagnostics){
-         PrintFormat("[FailSafe] CloseAll fail (%s) ret=%d", reason, trade.ResultRetcode());
-      }
-   }
-}
-
-// Flatten EA positions by reversing trade direction (used by kill switch safeguards)
-void FlattenEAPositions(){
-   for(int p=PositionsTotal()-1; p>=0; --p){
-      if(!PositionSelectByIndex(p)) continue;
-      if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
-      string sym = PositionGetString(POSITION_SYMBOL);
-      long   type = (long)PositionGetInteger(POSITION_TYPE);
-      double vol  = PositionGetDouble(POSITION_VOLUME);
-      if(vol<=0.0) continue;
-
-      trade.SetExpertMagicNumber(Magic);
-      if(type==POSITION_TYPE_BUY){
-         trade.Sell(vol, sym);
-      }else if(type==POSITION_TYPE_SELL){
-         trade.Buy(vol, sym);
-      }
-   }
-}
-
-// recompute realized R from history since 'sinceTs' (closed deals only)
-double ComputeRealizedR(const datetime sinceTs,const int maxDeals=500){
-   double sumR=0.0;
-   const datetime toTs = TimeCurrent();
-   HistorySelect(sinceTs,toTs);
-   int deals = (int)HistoryDealsTotal();
-   int counted=0;
-   for(int i=deals-1;i>=0 && counted<maxDeals;i--){
-      ulong dealId = HistoryDealGetTicket(i);
-      if(!HistoryDealSelect(dealId)) continue;
-      if((ulong)HistoryDealGetInteger(dealId,DEAL_MAGIC) != Magic) continue;
-      if(HistoryDealGetInteger(dealId,DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
-      string sym    = HistoryDealGetString(dealId,DEAL_SYMBOL);
-      double profit = HistoryDealGetDouble(dealId,DEAL_PROFIT)
-                    + HistoryDealGetDouble(dealId,DEAL_SWAP)
-                    + HistoryDealGetDouble(dealId,DEAL_COMMISSION);
-      ulong posId   = (ulong)HistoryDealGetInteger(dealId,DEAL_POSITION_ID);
-      double riskMoney = RiskMapPop(posId);  // may be 0 if EA restarted
-      if(riskMoney<=0){
-         double bal = AccountInfoDouble(ACCOUNT_BALANCE);
-         double pct = (gEffectiveRiskPct>0.0?gEffectiveRiskPct:Risk_Percent);
-         riskMoney  = MathMax(0.01, bal * (pct/100.0));
-      }
-      double r = (riskMoney>0.0 ? profit/riskMoney : 0.0);
-      if(MathIsValidNumber(r)) sumR += r;
-      counted++;
-   }
-   return sumR;
-}
-
 input group "=== Core Filters ==="
 input int      H1_EMA_Fast     = 50;
 input int      H1_EMA_Slow     = 200;
@@ -366,6 +303,67 @@ int hEMA_H1_fast, hEMA_H1_slow, hEMA_M15_pull, hEMA_M15_struct;
 int hRSI_M15, hMACD_M15, hATR_M15, hFractals_M15;
 int hADX = INVALID_HANDLE; // ADX for new entry flow
 CTrade trade;
+
+void CloseAllEAPositions(const string reason=""){
+   for(int i=PositionsTotal()-1; i>=0; --i){
+      if(!PositionSelectByIndex(i)) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
+      string sym = PositionGetString(POSITION_SYMBOL);
+      double vol = PositionGetDouble(POSITION_VOLUME);
+      if(vol<=0.0) continue;
+      trade.SetExpertMagicNumber(Magic);
+      if(!trade.PositionClose(sym) && Enable_Diagnostics){
+         PrintFormat("[FailSafe] CloseAll fail (%s) ret=%d", reason, trade.ResultRetcode());
+      }
+   }
+}
+
+void FlattenEAPositions(){
+   for(int p=PositionsTotal()-1; p>=0; --p){
+      if(!PositionSelectByIndex(p)) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
+      string sym = PositionGetString(POSITION_SYMBOL);
+      long   type = (long)PositionGetInteger(POSITION_TYPE);
+      double vol  = PositionGetDouble(POSITION_VOLUME);
+      if(vol<=0.0) continue;
+
+      trade.SetExpertMagicNumber(Magic);
+      if(type==POSITION_TYPE_BUY){
+         trade.Sell(vol, sym);
+      }else if(type==POSITION_TYPE_SELL){
+         trade.Buy(vol, sym);
+      }
+   }
+}
+
+double ComputeRealizedR(const datetime sinceTs,const int maxDeals=500){
+   double sumR=0.0;
+   const datetime toTs = TimeCurrent();
+   HistorySelect(sinceTs,toTs);
+   int deals = (int)HistoryDealsTotal();
+   int counted=0;
+   for(int i=deals-1;i>=0 && counted<maxDeals;i--){
+      ulong dealId = HistoryDealGetTicket(i);
+      if(!HistoryDealSelect(dealId)) continue;
+      if((ulong)HistoryDealGetInteger(dealId,DEAL_MAGIC) != Magic) continue;
+      if(HistoryDealGetInteger(dealId,DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+      string sym    = HistoryDealGetString(dealId,DEAL_SYMBOL);
+      double profit = HistoryDealGetDouble(dealId,DEAL_PROFIT)
+                    + HistoryDealGetDouble(dealId,DEAL_SWAP)
+                    + HistoryDealGetDouble(dealId,DEAL_COMMISSION);
+      ulong posId   = (ulong)HistoryDealGetInteger(dealId,DEAL_POSITION_ID);
+      double riskMoney = RiskMapPop(posId);  // may be 0 if EA restarted
+      if(riskMoney<=0){
+         double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+         double pct = (gEffectiveRiskPct>0.0?gEffectiveRiskPct:Risk_Percent);
+         riskMoney  = MathMax(0.01, bal * (pct/100.0));
+      }
+      double r = (riskMoney>0.0 ? profit/riskMoney : 0.0);
+      if(MathIsValidNumber(r)) sumR += r;
+      counted++;
+   }
+   return sumR;
+}
 
 //--- state
 // --- winrate rolling window (bounded) ---
