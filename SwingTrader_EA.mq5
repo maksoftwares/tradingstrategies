@@ -9,6 +9,14 @@
 
 #include <Trade/Trade.mqh>
 
+// --- Globals introduced by safety patches ---
+double gEffectiveRiskPct = 0.0;  // risk throttle multiplier output
+double gPeakEquity = 0.0;        // peak equity anchor for kill-switch
+double gDayStartEquity = 0.0;    // day anchor (reset each day)
+
+// Forward for equity winrate gate
+bool EquityWinrateGateActive();
+
 inline bool IsFiniteD(const double x)
 {
    return MathIsValidNumber(x);
@@ -18,7 +26,7 @@ inline bool IsFiniteD(const double x)
 double  gR_day=0.0, gR_week=0.0;
 int     gDayId=-1, gWeekId=-1;
 datetime gLastTradeTime=0;
-double  gDayStartEquity=0.0, weekStartEquity=0.0;
+double  weekStartEquity=0.0;
 // tiny map for entry risk capture
 ulong gOpenTicket[16]; double gOpenRiskMoney[16]; int gOpenCount=0;
 void RiskMapPut(ulong t,double m){ for(int i=0;i<gOpenCount;i++) if(gOpenTicket[i]==t){ gOpenRiskMoney[i]=m; return; } if(gOpenCount<16){ gOpenTicket[gOpenCount]=t; gOpenRiskMoney[gOpenCount]=m; gOpenCount++; } }
@@ -255,8 +263,6 @@ input double PeakDD_SoftThrottlePct  = 12.0;   // throttle risk beyond this DD f
 input double Max_Open_Risk_R         = 1.8;    // sum of open risks (in R), block new trades if exceeded
 
 // Anchors
-double gPeakEquity = 0.0;
-double gEffectiveRiskPct = 0.0;
 bool   gPeakHardStopActive = false;
 
 input group "=== Adaptive Frequency Layer ==="
@@ -1864,7 +1870,7 @@ bool SafeOrderSend(MqlTradeRequest &rq, MqlTradeResult &rs)
 double LotsFromRisk(double stop_points){
    if(stop_points<=0) return 0.0;
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double risk_pct = CurrentRiskPercent();
+   double risk_pct = (gEffectiveRiskPct>0.0 ? gEffectiveRiskPct : Risk_Percent);
    double risk_money = balance * (risk_pct/100.0);
 
    double tick_value = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
@@ -2615,76 +2621,90 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
    }
 }
 
-void OnTick(){
-   ResetDailyCounters();
-   ResetRiskWindowsIfNeeded();
-   double eqNow = AccountInfoDouble(ACCOUNT_EQUITY);
-   if(gPeakEquity <= 0.0) gPeakEquity = eqNow;
-   if(eqNow > gPeakEquity) gPeakEquity = eqNow;
-
-   double ddFromPeakPct = (gPeakEquity>0.0 ? 100.0*(gPeakEquity - eqNow)/gPeakEquity : 0.0);
-   if(PeakDD_HardStopPct > 0.0 && ddFromPeakPct >= PeakDD_HardStopPct){
-      if(!gPeakHardStopActive){
-         if(Enable_Diagnostics) PrintFormat("[FailSafe] Peak-DD hard stop hit: %.2f%%", ddFromPeakPct);
-         CloseAllEAPositions("peak-dd-hard-stop");
-         cooldownBarsRemaining = DayLossCap_LockBars;
-         gPeakHardStopActive = true;
-      }
-   }
-
-   double riskMult = 1.0;
-   if(PeakDD_SoftThrottlePct > 0.0 && ddFromPeakPct >= PeakDD_SoftThrottlePct){
-      double span = MathMax(1.0, PeakDD_HardStopPct - PeakDD_SoftThrottlePct);
-      riskMult = MathMax(0.35, 1.0 - (ddFromPeakPct - PeakDD_SoftThrottlePct)/span);
-   }
-   gEffectiveRiskPct = Risk_Percent * riskMult;
-   // Reset weekly anchor on new week
-   MqlDateTime _dt; TimeToStruct(TimeCurrent(), _dt);
-   int _weekId = (int)(_dt.year*100 + (_dt.day_of_year/7));
-   if(_weekId != lastWeekId) { lastWeekId = _weekId; weekStartEquity = AccountInfoDouble(ACCOUNT_EQUITY); }
-   // manage open trade each tick
-   ManagePartialAndTrail();
-
-   // If a gate is active, ensure no pending orders remain (MQL5-safe)
-   const bool eqGateNow = EquityWinrateGateActive();  // declare (or inline) the gate result
-   if(eqGateNow && Gate_ClosePositions){
-      CloseAllEAPositions("eq-winrate-gate");
-   }
+// Cancel all pending orders that belong to this EA if any gate is active (MQL5-safe)
+void CleanupPendingsIfGated()
+{
+   const bool eqGateNow = EquityWinrateGateActive();
 
    if ((RiskGate_Enable && gR_day <= DayLossCap_R) || eqGateNow || gPeakHardStopActive)
    {
       const int total = OrdersTotal();
       for (int i = total - 1; i >= 0; --i)
       {
-         // MQL5: get ticket by list index, then select by ticket
-         const ulong ticket = OrderGetTicket(i);
-         if (ticket == 0) continue;
-         if (!OrderSelect(ticket)) continue;  // MQL5 signature: OrderSelect(ulong ticket)
+         const ulong ticket = OrderGetTicket(i);         // MQL5: get ticket by index
+         if(ticket == 0)           continue;
+         if(!OrderSelect(ticket))  continue;             // MQL5 signature: OrderSelect(ulong ticket)
+         if((ulong)OrderGetInteger(ORDER_MAGIC) != Magic) continue;
 
-         // Only this EA’s orders
-         if ((ulong)OrderGetInteger(ORDER_MAGIC) != Magic) continue;
-
-         // Pending orders only
-         const ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         const ENUM_ORDER_TYPE type  = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
          const bool isPending =
-            (type == ORDER_TYPE_BUY_LIMIT  || type == ORDER_TYPE_SELL_LIMIT ||
-             type == ORDER_TYPE_BUY_STOP   || type == ORDER_TYPE_SELL_STOP);
-         if (!isPending) continue;
+            (type==ORDER_TYPE_BUY_LIMIT  || type==ORDER_TYPE_SELL_LIMIT ||
+             type==ORDER_TYPE_BUY_STOP   || type==ORDER_TYPE_SELL_STOP);
+         if(!isPending) continue;
 
-         // Live/placed states only
          const ENUM_ORDER_STATE state = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
-         if (state != ORDER_STATE_PLACED && state != ORDER_STATE_STARTED) continue;
+         if(state!=ORDER_STATE_PLACED && state!=ORDER_STATE_STARTED) continue;
 
-         // Delete using CTrade helper
          trade.SetExpertMagicNumber(Magic);
          trade.OrderDelete(ticket);
-
-         // (Fallback raw API if needed)
-         // MqlTradeRequest rr; MqlTradeResult rs; ZeroMemory(rr); ZeroMemory(rs);
-         // rr.action = TRADE_ACTION_REMOVE; rr.order = ticket;
-         // OrderSend(rr, rs);
       }
    }
+}
+
+void OnTick(){
+   ResetDailyCounters();
+   ResetRiskWindowsIfNeeded();
+   // ----- Update peak equity and apply kill switch / risk throttle -----
+   {
+      double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(gPeakEquity <= 0.0) gPeakEquity = eq;
+      if(eq > gPeakEquity)   gPeakEquity = eq;
+
+      double ddFromPeakPct = (gPeakEquity>0.0 ? 100.0*(gPeakEquity - eq)/gPeakEquity : 0.0);
+      if(PeakDD_HardStopPct > 0.0 && ddFromPeakPct >= PeakDD_HardStopPct)
+      {
+         if(!gPeakHardStopActive)
+         {
+            if(Enable_Diagnostics)
+               Print("[FailSafe] Peak-DD hard stop hit: ", DoubleToString(ddFromPeakPct,2), "%");
+            for(int p=PositionsTotal()-1; p>=0; --p)
+            {
+               if(!PositionSelectByIndex(p)) continue;
+               if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
+               string sym = PositionGetString(POSITION_SYMBOL);
+               long   t   = (long)PositionGetInteger(POSITION_TYPE);
+               double v   = PositionGetDouble(POSITION_VOLUME);
+               if(v<=0.0) continue;
+               trade.SetExpertMagicNumber(Magic);
+               if(t==POSITION_TYPE_BUY)  trade.Sell(v, sym);
+               else                      trade.Buy(v, sym);
+            }
+         }
+         cooldownBarsRemaining = DayLossCap_LockBars; // pause for rest of the day
+         gPeakHardStopActive = true;
+      }
+
+      double riskMult = 1.0;
+      if(PeakDD_SoftThrottlePct > 0.0 && ddFromPeakPct >= PeakDD_SoftThrottlePct)
+      {
+         double span = MathMax(1.0, PeakDD_HardStopPct - PeakDD_SoftThrottlePct);
+         riskMult = MathMax(0.35, 1.0 - (ddFromPeakPct - PeakDD_SoftThrottlePct)/span);
+      }
+      gEffectiveRiskPct = Risk_Percent * riskMult;
+   }
+   // Reset weekly anchor on new week
+   MqlDateTime _dt; TimeToStruct(TimeCurrent(), _dt);
+   int _weekId = (int)(_dt.year*100 + (_dt.day_of_year/7));
+   if(_weekId != lastWeekId) { lastWeekId = _weekId; weekStartEquity = AccountInfoDouble(ACCOUNT_EQUITY); }
+   // manage open trade each tick
+   ManagePartialAndTrail();
+   const bool eqGateNow = EquityWinrateGateActive();
+   if(eqGateNow && Gate_ClosePositions){
+      CloseAllEAPositions("eq-winrate-gate");
+   }
+
+   // --- keep counters / gates updated above this line ---
+   CleanupPendingsIfGated();
 
    // detect pending order filled (reset tracking variables)
    if(pendingTicket>0){
