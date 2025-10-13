@@ -39,14 +39,12 @@ datetime g_equity_peak_ts = 0;
 inline bool IsFiniteD(const double x){ return (x==x) && (x<1e308) && (x>-1e308); }
 
 // ---- Orders compatibility helpers (works on all MQL5 builds) ----
-ulong OrderGetTicketCompat(int index){
+ulong OrderGetTicketCompat(const int index){
 #ifdef __MQL5__
-   #ifdef OrderGetTicket
-      return OrderGetTicket(index);
-   #endif
+   return OrderGetTicket(index);
+#else
+   return 0;
 #endif
-   if(!OrderSelect(index, SELECT_BY_POS, MODE_TRADES)) return 0;
-   return (ulong)OrderGetInteger(ORDER_TICKET);
 }
 
 bool CancelPendingByTicket(const ulong ticket, const ulong magic){
@@ -63,12 +61,22 @@ bool CancelPendingByTicket(const ulong ticket, const ulong magic){
    const ENUM_ORDER_STATE state = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
    if(state!=ORDER_STATE_PLACED && state!=ORDER_STATE_STARTED) return false;
 
-   CTrade t; t.SetExpertMagicNumber(magic);
-   if(t.OrderDelete(ticket)) return true;
+   trade.SetExpertMagicNumber(magic);
+   if(trade.OrderDelete(ticket)) return true;
 
    MqlTradeRequest rq; MqlTradeResult rr; ZeroMemory(rq); ZeroMemory(rr);
    rq.action = TRADE_ACTION_REMOVE; rq.order = ticket;
    return OrderSend(rq, rr);
+}
+
+bool PositionSelectByIndexCompat(const int index){
+#ifdef __MQL5__
+   const ulong posTicket = PositionGetTicket(index);
+   if(posTicket==0) return false;
+   return PositionSelectByTicket(posTicket);
+#else
+   return false;
+#endif
 }
 
 void UpdateEquityPeak(double &peakStore){
@@ -393,7 +401,7 @@ CTrade trade;
 
 void CloseAllEAPositions(const string reason=""){
    for(int i=PositionsTotal()-1; i>=0; --i){
-      if(!PositionSelectByIndex(i)) continue;
+      if(!PositionSelectByIndexCompat(i)) continue;
       if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
       string sym = PositionGetString(POSITION_SYMBOL);
       double vol = PositionGetDouble(POSITION_VOLUME);
@@ -407,7 +415,7 @@ void CloseAllEAPositions(const string reason=""){
 
 void FlattenEAPositions(){
    for(int p=PositionsTotal()-1; p>=0; --p){
-      if(!PositionSelectByIndex(p)) continue;
+      if(!PositionSelectByIndexCompat(p)) continue;
       if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
       string sym = PositionGetString(POSITION_SYMBOL);
       long   type = (long)PositionGetInteger(POSITION_TYPE);
@@ -1400,7 +1408,7 @@ bool TryEnter(){
    double pctPerTrade = (gEffectiveRiskPct>0.0?gEffectiveRiskPct:Risk_Percent);
    double perTradeRisk = balance * (pctPerTrade/100.0);
    for(int p=PositionsTotal()-1; p>=0; --p){
-      if(!PositionSelectByIndex(p)) continue;
+      if(!PositionSelectByIndexCompat(p)) continue;
       if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
       double vol = PositionGetDouble(POSITION_VOLUME);
       double sl = PositionGetDouble(POSITION_SL);
@@ -2687,8 +2695,10 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
                  + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
    double riskMoney = RiskMapPop(ticket);
    if(riskMoney<=0.0)
-      double pct = (gEffectiveRiskPct>0.0?gEffectiveRiskPct:Risk_Percent);
+   {
+      const double pct = (gEffectiveRiskPct>0.0?gEffectiveRiskPct:Risk_Percent);
       riskMoney = MathMax(0.01, AccountInfoDouble(ACCOUNT_BALANCE)*(pct/100.0));
+   }
    double r = (riskMoney>0.0 ? profit / riskMoney : 0.0);
    // Safety clamps to prevent runaway gates if broker values momentarily misreport
    if(!IsFiniteD(r) || !IsFiniteD(profit)) r = 0.0;
