@@ -18,11 +18,26 @@ inline bool IsFiniteD(const double x)
 double  gR_day=0.0, gR_week=0.0;
 int     gDayId=-1, gWeekId=-1;
 datetime gLastTradeTime=0;
-double  dayStartEquity=0.0, weekStartEquity=0.0;
+double  gDayStartEquity=0.0, weekStartEquity=0.0;
 // tiny map for entry risk capture
 ulong gOpenTicket[16]; double gOpenRiskMoney[16]; int gOpenCount=0;
 void RiskMapPut(ulong t,double m){ for(int i=0;i<gOpenCount;i++) if(gOpenTicket[i]==t){ gOpenRiskMoney[i]=m; return; } if(gOpenCount<16){ gOpenTicket[gOpenCount]=t; gOpenRiskMoney[gOpenCount]=m; gOpenCount++; } }
+double RiskMapGet(ulong t){ for(int i=0;i<gOpenCount;i++){ if(gOpenTicket[i]==t) return gOpenRiskMoney[i]; } return 0.0; }
 double RiskMapPop(ulong t){ for(int i=0;i<gOpenCount;i++){ if(gOpenTicket[i]==t){ double v=gOpenRiskMoney[i]; gOpenCount--; gOpenTicket[i]=gOpenTicket[gOpenCount]; gOpenRiskMoney[i]=gOpenRiskMoney[gOpenCount]; return v; } } return 0.0; }
+
+void CloseAllEAPositions(const string reason=""){
+   for(int i=PositionsTotal()-1; i>=0; --i){
+      if(!PositionSelectByIndex(i)) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
+      string sym = PositionGetString(POSITION_SYMBOL);
+      double vol = PositionGetDouble(POSITION_VOLUME);
+      if(vol<=0.0) continue;
+      trade.SetExpertMagicNumber(Magic);
+      if(!trade.PositionClose(sym) && Enable_Diagnostics){
+         PrintFormat("[FailSafe] CloseAll fail (%s) ret=%d", reason, trade.ResultRetcode());
+      }
+   }
+}
 
 // recompute realized R from history since 'sinceTs' (closed deals only)
 double ComputeRealizedR(const datetime sinceTs,const int maxDeals=500){
@@ -44,7 +59,8 @@ double ComputeRealizedR(const datetime sinceTs,const int maxDeals=500){
       double riskMoney = RiskMapPop(posId);  // may be 0 if EA restarted
       if(riskMoney<=0){
          double bal = AccountInfoDouble(ACCOUNT_BALANCE);
-         riskMoney  = MathMax(0.01, bal * (Risk_Percent/100.0));
+         double pct = (gEffectiveRiskPct>0.0?gEffectiveRiskPct:Risk_Percent);
+         riskMoney  = MathMax(0.01, bal * (pct/100.0));
       }
       double r = (riskMoney>0.0 ? profit/riskMoney : 0.0);
       if(MathIsValidNumber(r)) sumR += r;
@@ -66,19 +82,19 @@ input int      MACD_Slow       = 26;
 input int      MACD_Signal     = 9;
 
 input group "=== Risk & Money Management ==="
-input double   Risk_Percent    = 0.60;     // % of balance per trade
+input double   Risk_Percent    = 0.45;     // % of balance per trade
 input double   MaxRiskLotsCap  = 0.10;     // hard cap per trade
 input double   MinStop_ATR     = 1.0;      // ensure SL distance >= 1×ATR
 input double   MinStop_Points  = 50.0;     // absolute floor in points
 input int      ATR_Period      = 14;
 input double   ATR_SL_mult     = 2.5;      // SL = max(ATR*mult, swing buffer)
 input double   Swing_Buffer_ATR= 0.20;     // extra beyond fractal (as ATR multiple)
-input double   TP1_R           = 1.00;     // first partial (tighter for faster risk reduction)
-input double   TP2_R           = 2.10;     // second partial / scale-out point
+input double   TP1_R           = 1.20;     // first partial (tighter for faster risk reduction)
+input double   TP2_R           = 2.40;     // second partial / scale-out point
 input double   TP3_R           = 3.50;     // runner target
 input bool     Use_TP3         = true;     // enable third target
-input double   TP1_Close_Pct   = 0.50;     // portion to close at TP1
-input double   TP2_Close_Pct   = 0.30;     // portion to close at TP2 (rest trails / TP3)
+input double   TP1_Close_Pct   = 0.60;     // portion to close at TP1
+input double   TP2_Close_Pct   = 0.25;     // portion to close at TP2 (rest trails / TP3)
 input bool     Adaptive_R_Targets = true;  // adjust TP2/TP3 with volatility regime
 input int      ATR_Regime_Period  = 50;    // ATR SMA period for regime calc
 input double   HighVolRatio       = 1.30;  // ATR / ATR_SMA > this => high vol (stretch targets)
@@ -88,9 +104,9 @@ input double   ATR_Regime_Min_Ratio = 0.75; // skip entries if ATR/ATR_SMA below
 input double   HighVol_Target_Boost = 0.6; // add to TP2/TP3 R
 input double   LowVol_Target_Reduction = 0.25; // subtract from TP2/TP3 R
 input bool     Use_Trailing    = true;     // chandelier trail after BE
-input double   Trail_ATR_mult  = 3.0;      // base trail
-input double   Trail_Tight_ATR_mult = 2.4; // tighter trail beyond trigger R
-input double   Trail_Tighten_Trigger_R = 2.0; // tighten trail after this R
+input double   Trail_ATR_mult  = 2.7;      // base trail
+input double   Trail_Tight_ATR_mult = 2.0; // tighter trail beyond trigger R
+input double   Trail_Tighten_Trigger_R = 1.8; // tighten trail after this R
 input bool     Use_Time_Exit   = true;     // exit stale trades
 input int      Max_Bars_In_Trade = 96;     // close if trade exceeds this many M15 bars (~24h)
 input bool     Use_Vol_Compress_Exit = true; // exit if volatility collapses
@@ -98,8 +114,8 @@ input double   Vol_Compress_Ratio = 0.65;  // ATR(now)/ATR(entry) below => exit 
 input int      MinBarsBeforeExit = 4; // do not evaluate time/vol exits until N bars after fill
 
 input group "=== Risk Caps & Probes ==="
-input bool   Enable_RiskCaps          = false;   // enable budget caps
-input double Risk_Percent_Base        = 0.35;    // base % risk per trade (0.35%)
+input bool   Enable_RiskCaps          = true;    // enable budget caps
+input double Risk_Percent_Base        = 0.45;    // base % risk per trade (0.45%)
 input double DailyLossCap_R           = 1.8;     // stop trading for the day if net closed loss <= -1.8R
 input double WeeklyLossCap_R          = 4.0;     // stop trading for the week if net closed loss <= -4R
 input bool   Allow_Probe_When_Capped  = true;    // still allow micro lot probe trades under caps
@@ -118,9 +134,9 @@ input int      DD_IdleUnlockBars      = 64;
 
 input group "=== Day Loss Cap ==="
 input bool   DayLossCap_Enable         = true;
-input int    DayLossCap_MaxLosses      = 3;
-input double DayLossCap_MinR           = -3.0;
-input int    DayLossCap_LockBars       = 32;  // ~8h on M15
+input int    DayLossCap_MaxLosses      = 2;
+input double DayLossCap_MinR           = -2.2;
+input int    DayLossCap_LockBars       = 48;  // ~12h on M15
 input int    DayLossCap_IdleUnlockBars = 64;
 
 // --- Weekly equity cap (prevents overtrading after drawdown weeks)
@@ -131,17 +147,17 @@ input double DailyRiskCapPct       = 15.0;  // daily cap when enabled
 int    lastWeekId = -1;
 
 input group "=== Trade Hygiene ==="
-input int      MaxSpreadPoints = 200;      // reject entries if spread too wide
+input int      MaxSpreadPoints = 260;      // reject entries if spread too wide
 input ulong    Magic           = 20251011; // EA magic
 
 input group "=== Advanced Filters & Sessions ==="
 input bool     RequireBothMomentum    = false; // require both MACD & RSI (false = either)
 input double   Min_ATR_Filter         = 6.0;    // Minimum ATR (points) to allow trades
 input double   Max_Close_Extension_ATR= 0.9;    // Reject if close is > this * ATR above/below pullback EMA
-input bool     Use_Session_Filter     = false;  // Restrict trading to session hours
-input bool     Only_London_NY         = false;  // keep false to preserve frequency
-input int      Session_Start_Hour     = 6;      // Session start (server time)
-input int      Session_End_Hour       = 20;     // Session end
+input bool     Use_Session_Filter     = true;   // Restrict trading to session hours
+input bool     Only_London_NY         = true;   // restrict trading to London/NY when session filter enabled
+input int      Session_Start_Hour     = 7;      // Session start (server time)
+input int      Session_End_Hour       = 19;     // Session end
 input bool     DelayTrailUntilPartial = true;   // Do not trail until partial profit
 input double   Trail_Start_R          = 1.8;    // Start trailing only after this R reached if partial not yet
 input group "=== Diagnostics ==="
@@ -177,20 +193,20 @@ input int      SR_Lookback            = 20;     // swing high/low lookback for n
 input group "=== Confirmation Entry (Stop Orders) ==="
 input bool     Use_Stop_Confirmation  = true;   // Use pending stop orders for confirmation
 input int      EntryBufferPts         = 14;     // buffer (points) beyond signal candle extreme
-input int      PendingOrder_Expiry_Bars = 4;    // cancel pending after N bars
+input int      PendingOrder_Expiry_Bars = 3;    // cancel pending after N bars
 input bool     UseStopOrders          = true;   // New flow toggle (market vs stop)
 input double   EntryBufferPts_New     = 14;     // New flow entry buffer
 
 input group "=== Break-Even Logic ==="
 input bool     MoveBE_On_StructureBreak = true; // Move to BE only after structure break
-input double   BE_Fallback_R          = 1.10;   // fallback R to force BE if no break
+input double   BE_Fallback_R          = 1.00;   // fallback R to force BE if no break
 input int      Break_Buffer_Points    = 10;     // extra points above/below signal high/low to count break
 
 input group "=== Dynamic Spread & Sessions ==="
 input bool     Dynamic_Spread_Cap     = true;   // dynamic spread cap using ATR
 input double   Spread_ATR_Fraction    = 0.30;   // allowed spread = % of ATR (points)
 input int      HardSpreadCapPts       = 600;    // absolute safety ceiling
-input bool     Stage2_IgnoresSpread   = true;   // bypass spread check at stage 2 when no trades yet
+input bool     Stage2_IgnoresSpread   = false;  // allow stage 2 spread bypass (disabled by default)
 input bool     Enhanced_Session_Filter= false;  // refined session rules (DISABLED for 24h trading)
 input int      LondonNY_Start_Hour    = 6;      // Session start (0=all day)
 input int      LondonNY_End_Hour      = 20;     // Session end (24=all day)
@@ -231,7 +247,17 @@ input int    WinrateWindowN   = 24;     // min sample for equity/winrate gate
 input double WinrateMin       = 0.33;   // pause only if winrate < 33%
 input int    WinrateCooldownBars = 48;  // cool-off, not whole day
 input int    Winrate_IdleUnlockBars = 64; // auto-unlock if idle this long
-input bool   Gate_ClosePositions = false; // gates block new entries only
+input bool   Gate_ClosePositions = true;  // optionally flatten open trades when gate trips
+
+// -------- Peak-DD kill switch & cumulative-risk guard --------
+input double PeakDD_HardStopPct      = 28.0;   // flatten + disable day if peak DD exceeds
+input double PeakDD_SoftThrottlePct  = 12.0;   // throttle risk beyond this DD from peak
+input double Max_Open_Risk_R         = 1.8;    // sum of open risks (in R), block new trades if exceeded
+
+// Anchors
+double gPeakEquity = 0.0;
+double gEffectiveRiskPct = 0.0;
+bool   gPeakHardStopActive = false;
 
 input group "=== Adaptive Frequency Layer ==="
 input bool   AdaptiveLoosen     = true;  // enable dynamic threshold loosening intraday
@@ -250,7 +276,7 @@ input double MinSpace_ATR_L2    = 0.20;   // structure space stage 2
 input int    RSI_Mid_L2         = 49;    // slightly easier RSI midline at stage 2
 
 input group "=== Equity Gate & Probe Lane ==="
-input bool     Use_EquityGate          = false;  // If true, pause entries when recent win-rate is poor, but auto-grace after N bars.
+input bool     Use_EquityGate          = true;   // If true, pause entries when recent win-rate is poor, but auto-grace after N bars.
 input int      Gate_Lookback_Trades    = 20;
 input double   Gate_Min_Winrate        = 0.33;
 input int      Gate_Grace_Bars         = 96;     // ~1 day on M15; after this many bars without an entry, bypass equity gate once.
@@ -273,9 +299,9 @@ input double   Quota_Min_ATR_Points     = 350.0;  // min ATR(points) to avoid de
 input double   Quota_MaxSpread_ATR_Frac = 0.30;   // spread must be <= this * ATR(points)
 
 input group "=== Safety & Quota Guards ==="
-input double   DailyRiskMaxPct          = 10.0;   // Max % of BALANCE allowed to lose in a single day; block new entries when exceeded.
-input double   WeeklyRiskMaxPct         = 25.0;   // Max % of BALANCE allowed to lose in rolling 5 trading days.
-input int      MaxConsecLosses_Day      = 3;      // If we hit this many losses in a single day, pause further entries until next session.
+input double   DailyRiskMaxPct          = 6.0;    // Max % of BALANCE allowed to lose in a single day; block new entries when exceeded.
+input double   WeeklyRiskMaxPct         = 14.0;   // Max % of BALANCE allowed to lose in rolling 5 trading days.
+input int      MaxConsecLosses_Day      = 2;      // If we hit this many losses in a single day, pause further entries until next session.
 input double   Quota_ADX_Min            = 18.0;   // Minimum ADX on M15 for quota trade.
 input double   Quota_H1EMA_Separation_MinPts = 20.0; // Minimum separation between H1 fast/slow EMA in POINTS to allow quota.
 input bool     Quota_D1_Filter          = true;   // Require D1 close above/under D1 EMA50 in direction of trade for quota.
@@ -378,7 +404,6 @@ double R_week  = 0.0;         // closed PnL in R for current week
 int    day_id  = -1;          // yyyyMMdd of last update
 int    week_id = -1;          // ISO week of year
 int    probe_trades_today = 0;
-double peak_equity = 0.0;
 double activeTradeRiskCash = 0.0;        // total monetary risk recorded at entry
 double activeTradeOneRCashPerLot = 0.0;  // 1R cash value per lot at entry
 double activeTradeInitialLots = 0.0;     // original position size (lots)
@@ -708,7 +733,9 @@ void ResetDailyCounters(){
       gDayId=dId;
       gR_day=0.0; TradesToday=0;
       dayLossCount=0; consecutiveLosses=0; cooldownBarsRemaining=0;
-      dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      gDayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      gPeakHardStopActive = false;
+      gEffectiveRiskPct = Risk_Percent;
       R_today = 0.0;
       // reset winrate buffer daily
       wrHead=0; wrSize=0; wrWins=0; wrLosses=0;
@@ -826,8 +853,8 @@ bool EquityDD_Gate(){
    if(dailyGrace && gLastTradeTime>dailyGraceStamp) dailyGrace=false;
    if(weeklyGrace && gLastTradeTime>weeklyGraceStamp) weeklyGrace=false;
 
-   if(DailyDD_Enable && dayStartEquity>0.0){
-      double dd = 100.0*(dayStartEquity-AccountInfoDouble(ACCOUNT_EQUITY))/dayStartEquity;
+   if(DailyDD_Enable && gDayStartEquity>0.0){
+      double dd = 100.0*(gDayStartEquity-AccountInfoDouble(ACCOUNT_EQUITY))/gDayStartEquity;
       if(dd > DailyDD_MaxPct){
          if(dailyGrace){
             dayBlocking=false;
@@ -1199,6 +1226,10 @@ bool TryEnter_WithProbe(bool probe_mode){
 
 bool TryEnter(){
    ResetDailyCounters();
+   if(gPeakHardStopActive){
+      DiagnosticsCount("peak-dd-hard-stop");
+      return LogAndReturnFalse("peak-dd-hard-stop");
+   }
    if(LossStreak_Protection && cooldownBarsRemaining>0){
       DiagnosticsCount("cooldown");
       return LogAndReturnFalse("cooldown");
@@ -1220,6 +1251,42 @@ bool TryEnter(){
       return LogAndReturnFalse("equity-dd-cap");
    }
    if(RiskGate_Enable && RiskGateBlocks())                return LogAndReturnFalse("risk-R-cap");
+
+   double totalOpenR = 0.0;
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double pctPerTrade = (gEffectiveRiskPct>0.0?gEffectiveRiskPct:Risk_Percent);
+   double perTradeRisk = balance * (pctPerTrade/100.0);
+   for(int p=PositionsTotal()-1; p>=0; --p){
+      if(!PositionSelectByIndex(p)) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
+      double vol = PositionGetDouble(POSITION_VOLUME);
+      double sl = PositionGetDouble(POSITION_SL);
+      if(vol<=0.0) continue;
+      if(sl<=0.0){
+         totalOpenR += 1.0;
+         continue;
+      }
+      ulong posTicket = (ulong)PositionGetInteger(POSITION_TICKET);
+      double riskCash = RiskMapGet(posTicket);
+      if(riskCash<=0.0){
+         string sym = PositionGetString(POSITION_SYMBOL);
+         double open = PositionGetDouble(POSITION_PRICE_OPEN);
+         double loss=0.0;
+         ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+         ENUM_ORDER_TYPE closeSide = (ptype==POSITION_TYPE_BUY?ORDER_TYPE_SELL:ORDER_TYPE_BUY);
+         if(OrderCalcProfit(closeSide, sym, vol, open, sl, loss))
+            riskCash = MathAbs(loss);
+      }
+      if(riskCash<=0.0) continue;
+      double riskR = (perTradeRisk>0.0 ? riskCash / perTradeRisk : 0.0);
+      if(riskR<=0.0) riskR = 1.0;
+      totalOpenR += MathAbs(riskR);
+   }
+   if(totalOpenR >= Max_Open_Risk_R){
+      if(Enable_Diagnostics)
+         PrintFormat("[Gate] cumulative open risk R=%.2f >= %.2f", totalOpenR, Max_Open_Risk_R);
+      return LogAndReturnFalse("risk-cumulative");
+   }
 
    string why="";
 
@@ -1949,12 +2016,15 @@ void ResetRiskWindowsIfNeeded(){
 
 double CurrentRiskPercent(){
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-   if(peak_equity <= 0.0) peak_equity = eq;
-   if(eq > peak_equity) peak_equity = eq;
-   double dd_pct = 100.0 * (peak_equity - eq) / MathMax(1.0, peak_equity);
-   double base = Risk_Percent_Base;
-   if(dd_pct >= Risk_Throttle_DD_Pct) base = MathMin(base, Risk_Throttle_Pct);
-   return base;
+   if(gPeakEquity <= 0.0) gPeakEquity = eq;
+   if(eq > gPeakEquity) gPeakEquity = eq;
+   double dd_pct = 100.0 * (gPeakEquity - eq) / MathMax(1.0, gPeakEquity);
+   double effective = (gEffectiveRiskPct>0.0 ? gEffectiveRiskPct : Risk_Percent);
+   double base = (Risk_Percent_Base>0.0 ? Risk_Percent_Base : effective);
+   double risk = (base>0.0 ? MathMin(base, effective) : effective);
+   if(dd_pct >= Risk_Throttle_DD_Pct)
+      risk = MathMin(risk, Risk_Throttle_Pct);
+   return risk;
 }
 
 // Daily/weekly risk caps (approx R-based and balance-based)
@@ -2378,15 +2448,17 @@ int OnInit(){
    dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    if(weekStartBalance<=0.0) weekStartBalance = dayStartBalance;
    MqlDateTime initDt; TimeCurrent(initDt); weekAnchorDayOfYear = initDt.day_of_year;
-   dayStartEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
-   weekStartEquity = dayStartEquity;
+   gDayStartEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   weekStartEquity = gDayStartEquity;
    int _d,_w; DayWeekIds(TimeCurrent(),_d,_w); gDayId=_d; gWeekId=_w;
    dayLossCount = 0; quotaLossCount = 0;
    quotaPendingTicket = 0;
    quotaTradeActive = false;
    lastEntryBarTime = 0;
    ResetRiskWindowsIfNeeded();
-   peak_equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   gPeakEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   gEffectiveRiskPct = Risk_Percent;
+   gPeakHardStopActive = false;
    // Initialize weekly equity anchor
    MqlDateTime d; TimeToStruct(TimeCurrent(), d);
    int weekId = (int)(d.year*100 + (d.day_of_year/7));
@@ -2434,7 +2506,8 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
       }
       if(riskMoney<=0.0){
          // Fallback: use %risk of balance if SL missing/zero
-         riskMoney = MathMax(0.01, AccountInfoDouble(ACCOUNT_BALANCE)*(Risk_Percent/100.0));
+         double pct = (gEffectiveRiskPct>0.0?gEffectiveRiskPct:Risk_Percent);
+         riskMoney = MathMax(0.01, AccountInfoDouble(ACCOUNT_BALANCE)*(pct/100.0));
       }
       RiskMapPut(ticket, riskMoney);
 
@@ -2469,7 +2542,8 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
                  + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
    double riskMoney = RiskMapPop(ticket);
    if(riskMoney<=0.0)
-      riskMoney = MathMax(0.01, AccountInfoDouble(ACCOUNT_BALANCE)*(Risk_Percent/100.0));
+      double pct = (gEffectiveRiskPct>0.0?gEffectiveRiskPct:Risk_Percent);
+      riskMoney = MathMax(0.01, AccountInfoDouble(ACCOUNT_BALANCE)*(pct/100.0));
    double r = (riskMoney>0.0 ? profit / riskMoney : 0.0);
    // Safety clamps to prevent runaway gates if broker values momentarily misreport
    if(!MathIsValidNumber(r) || !MathIsValidNumber(profit)) r = 0.0;
@@ -2545,8 +2619,25 @@ void OnTick(){
    ResetDailyCounters();
    ResetRiskWindowsIfNeeded();
    double eqNow = AccountInfoDouble(ACCOUNT_EQUITY);
-   if(peak_equity <= 0.0) peak_equity = eqNow;
-   if(eqNow > peak_equity) peak_equity = eqNow;
+   if(gPeakEquity <= 0.0) gPeakEquity = eqNow;
+   if(eqNow > gPeakEquity) gPeakEquity = eqNow;
+
+   double ddFromPeakPct = (gPeakEquity>0.0 ? 100.0*(gPeakEquity - eqNow)/gPeakEquity : 0.0);
+   if(PeakDD_HardStopPct > 0.0 && ddFromPeakPct >= PeakDD_HardStopPct){
+      if(!gPeakHardStopActive){
+         if(Enable_Diagnostics) PrintFormat("[FailSafe] Peak-DD hard stop hit: %.2f%%", ddFromPeakPct);
+         CloseAllEAPositions("peak-dd-hard-stop");
+         cooldownBarsRemaining = DayLossCap_LockBars;
+         gPeakHardStopActive = true;
+      }
+   }
+
+   double riskMult = 1.0;
+   if(PeakDD_SoftThrottlePct > 0.0 && ddFromPeakPct >= PeakDD_SoftThrottlePct){
+      double span = MathMax(1.0, PeakDD_HardStopPct - PeakDD_SoftThrottlePct);
+      riskMult = MathMax(0.35, 1.0 - (ddFromPeakPct - PeakDD_SoftThrottlePct)/span);
+   }
+   gEffectiveRiskPct = Risk_Percent * riskMult;
    // Reset weekly anchor on new week
    MqlDateTime _dt; TimeToStruct(TimeCurrent(), _dt);
    int _weekId = (int)(_dt.year*100 + (_dt.day_of_year/7));
@@ -2556,8 +2647,11 @@ void OnTick(){
 
    // If a gate is active, ensure no pending orders remain (MQL5-safe)
    const bool eqGateNow = EquityWinrateGateActive();  // declare (or inline) the gate result
+   if(eqGateNow && Gate_ClosePositions){
+      CloseAllEAPositions("eq-winrate-gate");
+   }
 
-   if ((RiskGate_Enable && gR_day <= DayLossCap_R) || eqGateNow)
+   if ((RiskGate_Enable && gR_day <= DayLossCap_R) || eqGateNow || gPeakHardStopActive)
    {
       const int total = OrdersTotal();
       for (int i = total - 1; i >= 0; --i)
