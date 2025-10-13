@@ -48,6 +48,16 @@ bool PositionSelectByIndexCompat(const int index){
 #endif
 }
 
+bool OrderSelectByIndexCompat(const int index){
+#ifdef __MQL5__
+   const ulong ordTicket = OrderGetTicket(index);
+   if(ordTicket==0) return false;
+   return OrderSelect(ordTicket);
+#else
+   return OrderSelect(index, SELECT_BY_POS, MODE_TRADES);
+#endif
+}
+
 void UpdateEquityPeak(double &peakStore){
    const double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    if(eq>0.0 && (peakStore<=0.0 || eq>peakStore)){
@@ -72,7 +82,7 @@ bool GateActive(bool &eqGateOut, bool &dayGateOut, bool &wrGateOut,
 void CleanupPendingsIfGatedCompat(const bool gateNow, const ulong magic){
    if(!gateNow || !CancelPendings_WhenGated) return;
    for(int i=OrdersTotal()-1; i>=0; --i){
-      if(!OrderSelectByIndex(i)) continue;
+      if(!OrderSelectByIndexCompat(i)) continue;
       if((ulong)OrderGetInteger(ORDER_MAGIC) != magic) continue;
 
       ENUM_ORDER_TYPE typ = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
@@ -1978,7 +1988,7 @@ double OpenRiskR(){
 
    // --- live positions (our Magic only)
    for(int i=PositionsTotal()-1; i>=0; --i){
-      if(!PositionSelectByIndex(i)) continue;
+      if(!PositionSelectByIndexCompat(i)) continue;
       if((ulong)PositionGetInteger(POSITION_MAGIC) != Magic) continue;
 
       string sym  = PositionGetString(POSITION_SYMBOL);
@@ -2003,7 +2013,7 @@ double OpenRiskR(){
 
    // --- pending orders (calculate using order price & SL)
    for(int j=OrdersTotal()-1; j>=0; --j){
-      if(!OrderSelectByIndex(j)) continue;
+      if(!OrderSelectByIndexCompat(j)) continue;
       if((ulong)OrderGetInteger(ORDER_MAGIC) != Magic) continue;
 
       ENUM_ORDER_TYPE typ = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
