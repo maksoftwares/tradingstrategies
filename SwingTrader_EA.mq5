@@ -62,8 +62,8 @@ input double   ATR_Regime_Min_Ratio = 0.75; // skip entries if ATR/ATR_SMA below
 input double   HighVol_Target_Boost = 0.6; // add to TP2/TP3 R
 input double   LowVol_Target_Reduction = 0.25; // subtract from TP2/TP3 R
 input bool     Use_Trailing    = true;     // chandelier trail after BE
-input double   Trail_ATR_mult  = 3.0;      // base trail
-input double   Trail_Tight_ATR_mult = 2.4; // tighter trail beyond trigger R
+input double   Trail_ATR_mult  = 2.4;      // base trail
+input double   Trail_Tight_ATR_mult = 1.9; // tighter trail beyond trigger R
 input double   Trail_Tighten_Trigger_R = 2.0; // tighten trail after this R
 input bool     Use_Time_Exit   = true;     // exit stale trades
 input int      Max_Bars_In_Trade = 96;     // close if trade exceeds this many M15 bars (~24h)
@@ -135,15 +135,15 @@ input double   MinSlopePts            = 8;       // permissive minimum slope poi
 
 input group "=== Momentum Quality Thresholds ==="
 // Slight easing to improve fills
-input double   MACD_Min_Abs           = 0.08;   // keep modest
-input double   RSI_Min_Long           = 51.0;   // slightly looser
-input double   RSI_Max_Short          = 49.0;
+input double   MACD_Min_Abs           = 0.10;   // require more separation
+input double   RSI_Min_Long           = 52.0;   // push farther from 50
+input double   RSI_Max_Short          = 48.0;
 
 input group "=== Pullback / Structure Quality ==="
-input double   Min_Pull_Depth_ATR     = 0.10;   // was 0.12–0.15
+input double   Min_Pull_Depth_ATR     = 0.12;   // tighten pullback depth slightly
 input double   Structure_Buffer_ATR   = 0.06;
 input bool     Use_Structure_Space    = true;
-input double   MinSpace_ATR           = 0.90;
+input double   MinSpace_ATR           = 0.80;   // keep headroom without choking flow
 input int      Space_Lookback_Bars    = 80;
 input int      SR_Lookback            = 20;     // swing high/low lookback for new flow
 
@@ -153,10 +153,13 @@ input int      EntryBufferPts         = 14;     // buffer (points) beyond signal
 input int      PendingOrder_Expiry_Bars = 4;    // cancel pending after N bars
 input bool     UseStopOrders          = true;   // New flow toggle (market vs stop)
 input double   EntryBufferPts_New     = 14;     // New flow entry buffer
+input bool     Use_Retest_Entry     = true;  // wait 1 bar retest after break
+input int      Retest_MaxBars       = 2;     // allow entry within N bars of break
+input double   Retest_Ema_Proximity = 0.35;  // must retest to within 0.35*ATR of pullback EMA
 
 input group "=== Break-Even Logic ==="
 input bool     MoveBE_On_StructureBreak = true; // Move to BE only after structure break
-input double   BE_Fallback_R          = 1.10;   // fallback R to force BE if no break
+input double   BE_Fallback_R          = 1.00;   // fallback R to force BE if no break
 input int      Break_Buffer_Points    = 10;     // extra points above/below signal high/low to count break
 
 input group "=== Dynamic Spread & Sessions ==="
@@ -215,7 +218,7 @@ input int    ADX_Min_L2         = 14;
 input double CI_Max_L0          = 50.0;  // compression index max stage 0
 input double CI_Max_L1          = 60.0;  // compression index max stage 1
 input double CI_Max_L2          = 70.0;  // compression index max stage 2
-input double MinSpace_ATR_L0    = 0.90;
+input double MinSpace_ATR_L0    = 0.80;
 input double MinSpace_ATR_L1    = 0.60;
 input double MinSpace_ATR_L2    = 0.35;   // eased late-stage
 input int    RSI_Mid_L2         = 49;    // slightly easier RSI midline at stage 2
@@ -707,6 +710,97 @@ double CalcOpenRiskR(double &oneR_cash_out)
       if(riskCash>0.0 && (riskCash==riskCash)) sumRiskCash += riskCash;
    }
    return sumRiskCash / oneR_cash_out;
+}
+
+// 0..100 quality score blending momentum slope, candle hygiene, ADX and close placement
+double SignalQualityScore(bool wantLong,
+                          double macd_curr,double macd_prev,double macd_sig_prev,
+                          double rsi_curr,double rsi_3,
+                          const MqlRates &bar1,double atr,double adx_now)
+{
+   double macdHist_now  = macd_curr - macd_sig_prev;
+   double macdHist_prev = macd_prev - macd_sig_prev;
+   double macdSlope     = macdHist_now - macdHist_prev;
+
+   double rsiDist  = MathAbs(rsi_curr - 50.0);
+   double rsiSlope = rsi_curr - rsi_3;
+
+   double range = MathMax(1e-9, bar1.high - bar1.low);
+   double body  = MathAbs(bar1.close - bar1.open);
+   double bodyPct  = (range>0.0 ? body / range : 0.0);
+   double closePos = (range>0.0 ? (bar1.close - bar1.low) / range : 0.5);
+   if(!wantLong) closePos = (range>0.0 ? (bar1.high - bar1.close) / range : 0.5);
+
+   double adxScore = MathMin(35.0, MathMax(0.0, adx_now));
+
+   double upperWick = bar1.high - MathMax(bar1.open, bar1.close);
+   double lowerWick = MathMin(bar1.open, bar1.close) - bar1.low;
+   double wickBad   = wantLong ? (upperWick / range) : (lowerWick / range);
+   double wickPenalty = (wickBad>0.35 ? 10.0 : (wickBad>0.25 ? 5.0 : 0.0));
+
+   double atrRangeBoost = 0.0;
+   if(atr>0.0)
+   {
+      double rangeRatio = MathMin(1.5, range / atr);
+      atrRangeBoost = 10.0 * (rangeRatio - 1.0); // reward orderly ranges (~1×ATR)
+   }
+
+   double score = 0.0;
+   score += 35.0 * MathMax(0.0, (wantLong ? macdSlope : -macdSlope));
+   score += 0.8  * rsiDist;
+   score += 18.0 * MathMax(0.0, (wantLong ? rsiSlope : -rsiSlope));
+   score += 25.0 * bodyPct;
+   score += 25.0 * closePos;
+   score += 0.8  * adxScore;
+   score += atrRangeBoost;
+   score -= wickPenalty;
+
+   if(score < 0.0) score = 0.0;
+   if(score > 100.0) score = 100.0;
+   return score;
+}
+
+bool DangerBar(const MqlRates &bar, double atr, bool wantLong)
+{
+   double range = MathMax(1e-9, bar.high - bar.low);
+   if(atr>0.0 && range > 1.8 * atr)
+      return true;
+
+   double upperWick = bar.high - MathMax(bar.open, bar.close);
+   double lowerWick = MathMin(bar.open, bar.close) - bar.low;
+   double badWick = wantLong ? upperWick : lowerWick;
+   if(range>0.0 && (badWick / range) > 0.55)
+      return true;
+
+   return false;
+}
+
+double RoundNumDistance(double price, double atr)
+{
+   if(atr<=0.0) return 999.0;
+   double nearest5 = MathRound(price/5.0) * 5.0;
+   return MathAbs(price - nearest5) / atr;
+}
+
+bool RetestOK(bool wantLong, double emaPull, double atr)
+{
+   if(atr<=0.0) return false;
+   int bars = MathMax(1, Retest_MaxBars);
+   MqlRates rates[];
+   ArraySetAsSeries(rates,true);
+   int copied = CopyRates(_Symbol, PERIOD_M15, 1, bars, rates);
+   if(copied <= 0)
+      return false;
+
+   double threshold = Retest_Ema_Proximity * atr;
+   for(int i=0; i<copied; ++i)
+   {
+      double touch = wantLong ? rates[i].low : rates[i].high;
+      if(touch==0.0) continue;
+      if(MathAbs(touch - emaPull) <= threshold)
+         return true;
+   }
+   return false;
 }
 
 bool DayLossCapBlocks(){
@@ -1270,6 +1364,80 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
    }
    bool canLong = allowLongSide && trendUp && longMomentum && pullLong && aboveStruct && spaceLong && strengthUp && ciOK;
    bool canShort= allowShortSide && trendDown && shortMomentum && pullShort && belowStruct && spaceShort && strengthDown && ciOK;
+
+   // Stage-aware signal quality thresholding
+   if(canLong || canShort)
+   {
+      int stageQ = stage;
+      double Q_min = (stageQ==0 ? 64.0 : stageQ==1 ? 58.0 : 52.0);
+
+      double adx_now = 0.0;
+      if(hADX!=INVALID_HANDLE)
+      {
+         double b0[];
+         if(CopyBuffer(hADX,0,0,1,b0)>0)
+            adx_now = b0[0];
+      }
+
+      double macd_sig_prev = macdSig_2;
+      GetValue(hMACD_M15,1,2,macd_sig_prev);
+      MqlRates qualityBar = m15[1];
+      double scoreLong  = SignalQualityScore(true,  macd_curr, macd_prev, macd_sig_prev, rsi_curr, rsi_3, qualityBar, atr, adx_now);
+      double scoreShort = SignalQualityScore(false, macd_curr, macd_prev, macd_sig_prev, rsi_curr, rsi_3, qualityBar, atr, adx_now);
+
+      if(canLong  && scoreLong  < Q_min){ canLong=false;  AppendReason(why,"qLong"); }
+      if(canShort && scoreShort < Q_min){ canShort=false; AppendReason(why,"qShort"); }
+   }
+
+   // Danger bar / round-number congestion filters
+   if(canLong)
+   {
+      if(DangerBar(m15[1], atr, true))
+      {
+         canLong=false;
+         AppendReason(why,"dangerBarLong");
+      }
+      else
+      {
+         double distRN = RoundNumDistance(m15[1].close, atr);
+         if(distRN < 0.25)
+         {
+            canLong=false;
+            AppendReason(why,"roundNumLong");
+         }
+      }
+   }
+   if(canShort)
+   {
+      if(DangerBar(m15[1], atr, false))
+      {
+         canShort=false;
+         AppendReason(why,"dangerBarShort");
+      }
+      else
+      {
+         double distRN = RoundNumDistance(m15[1].close, atr);
+         if(distRN < 0.25)
+         {
+            canShort=false;
+            AppendReason(why,"roundNumShort");
+         }
+      }
+   }
+
+   if(Use_Retest_Entry)
+   {
+      if(canLong && !RetestOK(true, emaPull_1, atr))
+      {
+         canLong=false;
+         AppendReason(why,"noRetest");
+      }
+      if(canShort && !RetestOK(false, emaPull_1, atr))
+      {
+         canShort=false;
+         AppendReason(why,"noRetest");
+      }
+   }
 
    if(!canLong && !canShort){
       if(!allowLongSide){
@@ -2150,6 +2318,39 @@ void ManagePartialAndTrail(){
          if(adverse && movePts < EarlyAbort_R * riskPts){
             trade.SetExpertMagicNumber(Magic);
             if(trade.PositionClose(_Symbol)){
+               partialTaken=false;
+               secondPartialTaken=false;
+               return;
+            }
+         }
+      }
+   }
+
+   // Early scratch when progress stalls and ADX is fading
+   if(entryTime>0){
+      int periodSec = PeriodSeconds(PERIOD_M15);
+      int barsHeld = (periodSec>0 ? (int)((TimeCurrent() - entryTime)/periodSec) : 0);
+      if(barsHeld >= 10){
+         double bidNow=0.0, askNow=0.0;
+         SymbolInfoDouble(_Symbol,SYMBOL_BID,bidNow);
+         SymbolInfoDouble(_Symbol,SYMBOL_ASK,askNow);
+         double curPrice = (type==POSITION_TYPE_BUY ? bidNow : askNow);
+         double riskPts = PointsFromPrice(MathAbs(open - sl));
+         double gainPts = PointsFromPrice(MathAbs(curPrice - open));
+         double rNow = (riskPts>0.0 ? gainPts / riskPts : 0.0);
+
+         double adx_now = 0.0, adx_prev = 0.0;
+         if(hADX!=INVALID_HANDLE){
+            double b0[], b1[];
+            if(CopyBuffer(hADX,0,0,1,b0)>0) adx_now = b0[0];
+            if(CopyBuffer(hADX,0,1,1,b1)>0) adx_prev = b1[0];
+         }
+
+         if(rNow < 0.20 && adx_now < adx_prev && adx_now>0.0)
+         {
+            trade.SetExpertMagicNumber(Magic);
+            if(trade.PositionClose(_Symbol))
+            {
                partialTaken=false;
                secondPartialTaken=false;
                return;
