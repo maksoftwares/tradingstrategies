@@ -8,6 +8,7 @@
 #property version   "1.00"
 
 #include <Trade/Trade.mqh>
+#include <Trade/PositionInfo.mqh>
 
 inline bool IsFiniteD(const double x)
 {
@@ -285,6 +286,7 @@ int hEMA_H1_fast, hEMA_H1_slow, hEMA_M15_pull, hEMA_M15_struct;
 int hRSI_M15, hMACD_M15, hATR_M15, hFractals_M15;
 int hADX = INVALID_HANDLE; // ADX for new entry flow
 CTrade trade;
+CPositionInfo positionInfo;
 
 //--- state
 datetime lastM15BarTime = 0;
@@ -686,14 +688,14 @@ double CalcOpenRiskR(double &oneR_cash_out)
 
    double sumRiskCash = 0.0;
    for(int i=PositionsTotal()-1; i>=0; --i){
-      if(!PositionSelectByIndex(i)) continue;
-      if((ulong)PositionGetInteger(POSITION_MAGIC) != Magic) continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)      continue;
+      if(!positionInfo.SelectByIndex(i)) continue;
+      if((ulong)positionInfo.Magic() != Magic) continue;
+      if(positionInfo.Symbol() != _Symbol)      continue;
 
-      long   ptype = (long)PositionGetInteger(POSITION_TYPE);
-      double vol   = PositionGetDouble(POSITION_VOLUME);
-      double open  = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl    = PositionGetDouble(POSITION_SL);
+      ENUM_POSITION_TYPE ptype = positionInfo.Type();
+      double vol   = positionInfo.Volume();
+      double open  = positionInfo.PriceOpen();
+      double sl    = positionInfo.StopLoss();
       if(vol<=0.0 || sl<=0.0 || open<=0.0) continue;
 
       if(ZeroRisk_When_BE){
