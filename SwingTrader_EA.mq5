@@ -25,6 +25,9 @@ double  dayStartEquity=0.0, weekStartEquity=0.0;
 double  g_lastOpenRiskR     = -1.0;
 int     g_openRiskFlatBars  = 0;
 
+input group "=== Build ==="
+input string   BuildTag         = "unblock_stage2_v2";
+
 input group "=== Core Filters ==="
 input int      H1_EMA_Fast     = 50;
 input int      H1_EMA_Slow     = 200;
@@ -107,7 +110,7 @@ input int      MaxSpreadPoints = 200;      // reject entries if spread too wide
 input ulong    Magic           = 20251011; // EA magic
 
 input group "=== Advanced Filters & Sessions ==="
-input bool     RequireBothMomentum    = false; // require both MACD & RSI (false = either)
+input bool     RequireBothMomentum    = true;  // require both MACD & RSI (stage logic can relax)
 input double   Min_ATR_Filter         = 6.0;    // Minimum ATR (points) to allow trades
 input double   Max_Close_Extension_ATR= 0.9;    // Reject if close is > this * ATR above/below pullback EMA
 input bool     Use_Session_Filter     = false;  // Restrict trading to session hours
@@ -131,7 +134,7 @@ input group "=== Trend & Strength Filters ==="
 // Trend & Strength Filters
 input bool     Use_ADX_Filter         = true;
 input int      ADX_Period             = 14;
-input double   Min_ADX                = 17.0;  // minimum ADX strength requirement
+input double   Min_ADX                = 18.0;  // minimum ADX strength requirement
 input bool     Use_EMA200_Slope       = true;
 input int      EMA200_Slope_Lookback  = 8;
 input double   Min_EMA200_Slope_Pts   = 12.0;  // minimum EMA200 slope in points
@@ -140,7 +143,7 @@ input double   MinSlopePts            = 8;       // permissive minimum slope poi
 
 input group "=== Momentum Quality Thresholds ==="
 // Slight easing to improve fills
-input double   MACD_Min_Abs           = 0.10;   // require more separation
+input double   MACD_Min_Abs           = 0.06;   // require modest separation
 input double   RSI_Min_Long           = 51.5;   // slight push away from 50
 input double   RSI_Max_Short          = 48.5;
 
@@ -151,7 +154,7 @@ input double Body_Min_L2 = 0.25;   // stage 2 (looser late session)
 
 input group "=== Pullback / Structure Quality ==="
 input double   Min_Pull_Depth_ATR     = 0.12;   // tighten pullback depth slightly
-input double   Structure_Buffer_ATR   = 0.06;
+input double   Structure_Buffer_ATR   = 0.05;
 input bool     Use_Structure_Space    = true;
 input double   MinSpace_ATR           = 0.80;   // keep headroom without choking flow
 input int      Space_Lookback_Bars    = 80;
@@ -310,6 +313,7 @@ CPositionInfo positionInfo;
 // day gate probe state
 bool     gDayProbeUsed = false;
 bool     gDayProbeConsumed = false;
+bool     gFallbackAttempted = false; // late-day permissive try flag
 datetime lastM15BarTime = 0;
 bool     partialTaken   = false;
 bool     secondPartialTaken = false;
@@ -683,6 +687,7 @@ void ResetDailyCounters(){
       R_today = 0.0;
       gDayProbeUsed = false;
       gDayProbeConsumed = false;
+      gFallbackAttempted = false;
    }
    if(gWeekId!=wId){
       gWeekId=wId;
@@ -1242,6 +1247,16 @@ bool TryEnter(){
    }
    string why="";
 
+   bool fallbackWindow = false;
+   if(TradesToday==0 && !gFallbackAttempted){
+      MqlDateTime __dt; TimeToStruct(TimeCurrent(), __dt);
+      if(__dt.hour >= 18)
+         fallbackWindow = true;
+   }
+   const bool fallbackActive = fallbackWindow;
+   if(fallbackActive)
+      gFallbackAttempted = true;
+
    // Equity gate with stall-grace
    if(!EquityGateAllows(why)) return LogAndReturnFalse(why);
 
@@ -1266,8 +1281,10 @@ bool TryEnter(){
    double body = MathAbs(m15[1].close - m15[1].open);
    double range= (m15[1].high - m15[1].low);
    int stage_b = LoosenStage();
-   double bodyMin = (stage_b==2 ? Body_Min_L2 : stage_b==1 ? Body_Min_L1 : Body_Min_L0);
-   bool   bodyOK = (range>0 && (body/range) >= bodyMin);
+   double minBodyFrac = (stage_b==0 ? 0.33 : 0.22);
+   if(fallbackActive)
+      minBodyFrac = MathMin(minBodyFrac, 0.18);
+   bool   bodyOK = (range>0 && (body/range) >= minBodyFrac);
    if(!bodyOK) { AppendReason(why,"weakBody"); return LogAndReturnFalse(why); }
    double atr;
    if(!GetValue(hATR_M15,0,1,atr)) { AppendReason(why,"atr"); return LogAndReturnFalse(why); }
@@ -1326,19 +1343,39 @@ bool TryEnter(){
    bool allowShortSide = allowShortManual;
    if(!AllowLongsAuto) allowLongSide=false;
    if(!AllowShortsAuto) allowShortSide=false;
+   if(stage>=2 || fallbackActive){
+      allowLongSide = allowLongManual;
+      allowShortSide = allowShortManual;
+   }
    bool macdUp = (macd_prev<=0 && macd_curr>0);
    bool macdDown=(macd_prev>=0 && macd_curr<0);
    bool rsiUp = (rsi_prev<50 && rsi_curr>50);
    bool rsiDown=(rsi_prev>50 && rsi_curr<50);
-   bool longMomentum = RequireBothMomentum ? (macdUp && rsiUp) : (macdUp || rsiUp);
-   bool shortMomentum= RequireBothMomentum ? (macdDown && rsiDown) : (macdDown || rsiDown);
 
    int stage_m = stage;
-   if(stage_m >= 2){
-      bool longOR  = (macdUp || rsiUp);
-      bool shortOR = (macdDown || rsiDown);
-      longMomentum  = longOR  && (rsi_curr >= RSI_Min_Long);
-      shortMomentum = shortOR && (rsi_curr <= RSI_Max_Short);
+   bool bothNeeded = (stage_m==0 && !fallbackActive && RequireBothMomentum);
+   if(fallbackActive)
+      bothNeeded = false;
+
+   bool longMomentum = bothNeeded ? (macdUp && rsiUp) : (macdUp || rsiUp);
+   bool shortMomentum= bothNeeded ? (macdDown && rsiDown) : (macdDown || rsiDown);
+
+   double macdAbsMinStage = (stage_m==2 ? 0.04 : MACD_Min_Abs);
+   double rsiLongFloor    = (stage_m==2 ? 49.5 : (stage_m==1 ? RSI_Min_Long-0.5 : RSI_Min_Long));
+   double rsiShortCeil    = (stage_m==2 ? 50.5 : (stage_m==1 ? RSI_Max_Short+0.5 : RSI_Max_Short));
+
+   if(!fallbackActive){
+      if(stage_m<=1){
+         if(!(macd_curr > 0.0 && MathAbs(macd_curr) >= MACD_Min_Abs))
+            longMomentum=false;
+         if(!(macd_curr < 0.0 && MathAbs(macd_curr) >= MACD_Min_Abs))
+            shortMomentum=false;
+      } else {
+         if(macd_curr < -macdAbsMinStage)
+            longMomentum=false;
+         if(macd_curr >  macdAbsMinStage)
+            shortMomentum=false;
+      }
    }
 
    double macdSig_1=0.0;
@@ -1357,13 +1394,41 @@ bool TryEnter(){
    bool rsiSlopeUp   = (rsi_curr > rsi_3 + 0.8);
    bool rsiSlopeDown = (rsi_curr < rsi_3 - 0.8);
 
-   longMomentum  = longMomentum  && macdRising  && rsiSlopeUp   && rsi_curr >= RSI_Min_Long;
-   shortMomentum = shortMomentum && macdFalling && rsiSlopeDown && rsi_curr <= RSI_Max_Short;
+   bool slopeLongOK  = macdRising  && rsiSlopeUp;
+   bool slopeShortOK = macdFalling && rsiSlopeDown;
+   if(stage_m==2){
+      slopeLongOK  = (macdRising || macdUp)   && (rsiSlopeUp   || rsiUp);
+      slopeShortOK = (macdFalling|| macdDown) && (rsiSlopeDown || rsiDown);
+   }
+   if(fallbackActive){
+      slopeLongOK = true;
+      slopeShortOK = true;
+   }
 
-   bool pullLong = (m15[1].low <= emaPull_1) && ((emaPull_1 - m15[1].low) >= Min_Pull_Depth_ATR * atr);
-   bool pullShort= (m15[1].high >= emaPull_1) && ((m15[1].high - emaPull_1) >= Min_Pull_Depth_ATR * atr);
+   longMomentum  = longMomentum  && slopeLongOK;
+   shortMomentum = shortMomentum && slopeShortOK;
+
+   if(!fallbackActive){
+      longMomentum  = longMomentum  && (rsi_curr >= rsiLongFloor);
+      shortMomentum = shortMomentum && (rsi_curr <= rsiShortCeil);
+   }
+
+   int stagePull = stage;
+   double pullMin = (stagePull==0 ? Min_Pull_Depth_ATR : MathMax(0.06, Min_Pull_Depth_ATR*0.75));
+   if(fallbackActive)
+      pullMin = MathMax(0.05, Min_Pull_Depth_ATR*0.5);
+   bool pullLong = (m15[1].low <= emaPull_1) && ((emaPull_1 - m15[1].low) >= pullMin * atr);
+   bool pullShort= (m15[1].high >= emaPull_1) && ((m15[1].high - emaPull_1) >= pullMin * atr);
+   if(fallbackActive){
+      pullLong = true;
+      pullShort = true;
+   }
    bool aboveStruct = m15[1].close > emaStruct_1 + Structure_Buffer_ATR * atr;
    bool belowStruct = m15[1].close < emaStruct_1 - Structure_Buffer_ATR * atr;
+   if(fallbackActive){
+      aboveStruct = true;
+      belowStruct = true;
+   }
 
    bool strengthUp=true,strengthDown=true; // permissive default
    if(hADX!=INVALID_HANDLE){
@@ -1377,20 +1442,29 @@ bool TryEnter(){
 
    int    adxMin   = (stage==2? ADX_Min_L2 : stage==1? ADX_Min_L1 : ADX_Min_L0);
    double ciMax    = (stage==2? CI_Max_L2  : stage==1? CI_Max_L1  : CI_Max_L0);
-   double spaceATR = (stage==2? MinSpace_ATR_L2 : stage==1? MinSpace_ATR_L1 : MinSpace_ATR_L0);
+   double spaceATRBase = (stage==2? MinSpace_ATR_L2 : stage==1? MinSpace_ATR_L1 : MinSpace_ATR_L0);
    int    rsiMidRef= 50; if(stage==2) rsiMidRef = RSI_Mid_L2; // midline easing only stage2
 
    double swingH=LastSwingHigh(SR_Lookback), swingL=LastSwingLow(SR_Lookback);
    double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK), bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
-   bool spaceLong = (swingH>0 && ask>0 ? (swingH-ask) >= spaceATR*atr : true);
-   bool spaceShort= (swingL>0 && bid>0 ? (bid-swingL) >= spaceATR*atr : true);
+   double spaceATR_stage = (stagePull==0 ? spaceATRBase : MathMin(spaceATRBase, 0.20));
+   if(fallbackActive)
+      spaceATR_stage = 0.0;
+   bool spaceLong = (swingH>0 && ask>0 ? (swingH-ask) >= spaceATR_stage*atr : true);
+   bool spaceShort= (swingL>0 && bid>0 ? (bid-swingL) >= spaceATR_stage*atr : true);
 
-// Compression Index gating (now MIN-style: higher is more compressed)
+// Compression Index gating (higher => more compressed)
 double ci = ComputeCompressionIndex(20);
-if(LoosenStage()==2) ci = 0.0; // bypass CI at stage 2
 double ciMin = (stage==2 ? CI_Min_L2 : (stage==1 ? CI_Min_L1 : CI_Min_L0));
-// If ciMin <= 0, disable gate
-bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
+if(stage==2)
+   ciMax = MathMax(ciMax, 80.0);
+bool ciOK = true;
+if(ciMin > 0.0 && ci < ciMin)
+   ciOK = false;
+if(ciMax > 0.0 && ci > ciMax)
+   ciOK = false;
+if(fallbackActive)
+   ciOK = true;
 
    // Adjust ADX gating to stage thresholds (permissive)
    if(hADX!=INVALID_HANDLE){
@@ -1400,6 +1474,14 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
          strengthUp   = (adx0 >= adxMin && diPlus0 > diMinus0);
          strengthDown = (adx0 >= adxMin && diMinus0 > diPlus0);
       }
+   }
+   if(Stage2_OptionalADX && stage==2){
+      strengthUp = true;
+      strengthDown = true;
+   }
+   if(fallbackActive){
+      strengthUp = true;
+      strengthDown = true;
    }
    bool canLong = allowLongSide && trendUp && longMomentum && pullLong && aboveStruct && spaceLong && strengthUp && ciOK;
    bool canShort= allowShortSide && trendDown && shortMomentum && pullShort && belowStruct && spaceShort && strengthDown && ciOK;
@@ -1622,6 +1704,8 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
                adxOKAlt = (adx0 >= adxMinAlt);
             }
          }
+      } else {
+         adxOKAlt = true;
       }
       
       // Slope optional at stage 2
@@ -1880,8 +1964,23 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
 
 // Helper function to log and return false
 bool LogAndReturnFalse(const string why){
-   if(Diagnostics && StringLen(why)>0)
-      PrintFormat("NO-ENTRY %s %s: %s", _Symbol, TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES), why);
+   if(Diagnostics && StringLen(why)>0){
+      int stage = LoosenStage();
+      double bodyMinLog = (stage==0 ? 0.33 : 0.22);
+      double spaceBase = (stage==2? MinSpace_ATR_L2 : stage==1? MinSpace_ATR_L1 : MinSpace_ATR_L0);
+      double spaceMinLog = (stage==0 ? spaceBase : MathMin(spaceBase, 0.20));
+      if(TradesToday==0 && gFallbackAttempted){
+         bodyMinLog = MathMin(bodyMinLog, 0.18);
+         spaceMinLog = 0.0;
+      }
+      PrintFormat("NO-ENTRY %s %s stage=%d body>=%.2f space>=%.2f : %s",
+                  _Symbol,
+                  TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES),
+                  stage,
+                  bodyMinLog,
+                  spaceMinLog,
+                  why);
+   }
    return false;
 }
 
@@ -2482,6 +2581,7 @@ void ManagePartialAndTrail(){
 }
 
 int OnInit(){
+   Print("[Build] ", BuildTag);
    PrintFormat("[VOL] min=%.3f step=%.3f max=%.3f",
                SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN),
                SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP),
