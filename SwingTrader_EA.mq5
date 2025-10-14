@@ -116,6 +116,11 @@ input int      Session_Start_Hour     = 6;      // Session start (server time)
 input int      Session_End_Hour       = 20;     // Session end
 input bool     DelayTrailUntilPartial = true;   // Do not trail until partial profit
 input double   Trail_Start_R          = 1.8;    // Start trailing only after this R reached if partial not yet
+
+input group "=== Equity/Winrate Filter (optional) ==="
+input bool Use_Equity_Filter    = false;  // disable if present in your build
+input double Min_Winrate_Thresh = 0.25;   // only used if Use_Equity_Filter=true
+
 input group "=== Diagnostics ==="
 input bool     Enable_Diagnostics     = true;   // Turn on rejection counting
 input int      Diagnostics_Every_Bars = 96;     // Print summary every N processed M15 bars (~1 day if 96)
@@ -136,8 +141,13 @@ input double   MinSlopePts            = 8;       // permissive minimum slope poi
 input group "=== Momentum Quality Thresholds ==="
 // Slight easing to improve fills
 input double   MACD_Min_Abs           = 0.10;   // require more separation
-input double   RSI_Min_Long           = 52.0;   // push farther from 50
-input double   RSI_Max_Short          = 48.0;
+input double   RSI_Min_Long           = 51.5;   // slight push away from 50
+input double   RSI_Max_Short          = 48.5;
+
+input group "=== Candle Body Thresholds (stage-aware) ==="
+input double Body_Min_L0 = 0.35;   // body/range minimum at stage 0
+input double Body_Min_L1 = 0.30;   // stage 1
+input double Body_Min_L2 = 0.25;   // stage 2 (looser late session)
 
 input group "=== Pullback / Structure Quality ==="
 input double   Min_Pull_Depth_ATR     = 0.12;   // tighten pullback depth slightly
@@ -204,8 +214,8 @@ input bool   Log_OpenRisk            = true;
 
 input group "=== Realized R Caps (day/week) ==="
 input bool   RiskGate_Enable         = true;
-input double RiskGate_MinR_Day       = -2.50;  // lock rest of day if below
-input double RiskGate_MinR_Week      = -6.00;  // lock until new week if below
+input double RiskGate_MinR_Day       = -2.0;   // lock rest of day if below
+input double RiskGate_MinR_Week      = -5.0;   // lock until new week if below
 
 input group "=== Adaptive Frequency Layer ==="
 input bool   AdaptiveLoosen     = true;
@@ -222,6 +232,11 @@ input double MinSpace_ATR_L0    = 0.80;
 input double MinSpace_ATR_L1    = 0.60;
 input double MinSpace_ATR_L2    = 0.35;   // eased late-stage
 input int    RSI_Mid_L2         = 49;    // slightly easier RSI midline at stage 2
+
+input group "=== Day Gate Idle/Probe ==="
+input int    DayGate_IdleUnlockBars = 64;   // ~16h on M15; unlock the day if no trades for long
+input bool   DayGate_ProbeOnce      = true; // allow exactly one micro-lot probe after idle unlock
+input double DayGate_ProbeLots      = 0.01; // lot size for probe (if used)
 
 input group "=== Equity Gate & Probe Lane ==="
 input bool     Use_EquityGate          = false;  // If true, pause entries when recent win-rate is poor, but auto-grace after N bars.
@@ -292,6 +307,9 @@ CTrade trade;
 CPositionInfo positionInfo;
 
 //--- state
+// day gate probe state
+bool     gDayProbeUsed = false;
+bool     gDayProbeConsumed = false;
 datetime lastM15BarTime = 0;
 bool     partialTaken   = false;
 bool     secondPartialTaken = false;
@@ -663,6 +681,8 @@ void ResetDailyCounters(){
       consecutiveLosses=0;
       dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
       R_today = 0.0;
+      gDayProbeUsed = false;
+      gDayProbeConsumed = false;
    }
    if(gWeekId!=wId){
       gWeekId=wId;
@@ -912,6 +932,7 @@ bool EquityDD_Gate(){
 }
 
 bool EquityFilterOK(){
+   if(!Use_Equity_Filter) return true;
    if(!Enable_Equity_Filter) return true;
    if(Equity_WinRate_Window <= 0) return true;
    int window = (int)MathMin(Equity_WinRate_Window,32);
@@ -923,9 +944,10 @@ bool EquityFilterOK(){
       if(recentWinsLosses[idx] > 0) wins++;
    }
    double wr = (window>0 ? (double)wins / (double)window : 1.0);
-   bool ok = (wr >= Equity_Min_WinRate);
+   double threshold = (Min_Winrate_Thresh>0.0 ? Min_Winrate_Thresh : Equity_Min_WinRate);
+   bool ok = (wr >= threshold);
    if(!ok && Enable_Diagnostics)
-      PrintFormat("[Gate] Equity filter paused winrate=%.2f thresh=%.2f", wr, Equity_Min_WinRate);
+      PrintFormat("[Gate] Equity filter paused winrate=%.2f thresh=%.2f", wr, threshold);
    return ok;
 }
 
@@ -1187,9 +1209,24 @@ bool TryEnter_WithProbe(bool probe_mode){
 
 bool TryEnter(){
    ResetDailyCounters();
+   bool dayLocked=false, weekLocked=false, unlockNow=false;
    if(RiskGate_Enable){
-      if(gR_day <= RiskGate_MinR_Day)  return LogAndReturnFalse("riskGate-day");
-      if(gR_week <= RiskGate_MinR_Week) return LogAndReturnFalse("riskGate-week");
+      dayLocked  = (gR_day  <= RiskGate_MinR_Day);
+      weekLocked = (gR_week <= RiskGate_MinR_Week);
+      int barsIdle = 0;
+      if(gLastTradeTime>0)
+         barsIdle = (int)((TimeCurrent() - gLastTradeTime)/PeriodSeconds(PERIOD_M15));
+      unlockNow = (barsIdle >= MathMax(DayGate_IdleUnlockBars, 0));
+   }
+   if(RiskGate_Enable){
+      if(weekLocked) return LogAndReturnFalse("riskGate-week");
+      if(dayLocked && !unlockNow) return LogAndReturnFalse("riskGate-day");
+      if(dayLocked && unlockNow && DayGate_ProbeOnce && !gDayProbeConsumed){
+         if(Enable_Diagnostics)
+            Print("[Gate] Day locked but idle-unlock active => allow one probe trade");
+         gDayProbeUsed = true;
+         gDayProbeConsumed = true;
+      }
    }
    if(LossStreak_Protection && cooldownBarsRemaining>0){
       DiagnosticsCount("cooldown");
@@ -1228,7 +1265,9 @@ bool TryEnter(){
    if(!GetRates(PERIOD_M15,3,m15)) { AppendReason(why,"rates"); return LogAndReturnFalse(why); }
    double body = MathAbs(m15[1].close - m15[1].open);
    double range= (m15[1].high - m15[1].low);
-   bool   bodyOK = (range>0 && (body/range) >= 0.25);
+   int stage_b = LoosenStage();
+   double bodyMin = (stage_b==2 ? Body_Min_L2 : stage_b==1 ? Body_Min_L1 : Body_Min_L0);
+   bool   bodyOK = (range>0 && (body/range) >= bodyMin);
    if(!bodyOK) { AppendReason(why,"weakBody"); return LogAndReturnFalse(why); }
    double atr;
    if(!GetValue(hATR_M15,0,1,atr)) { AppendReason(why,"atr"); return LogAndReturnFalse(why); }
@@ -1294,6 +1333,14 @@ bool TryEnter(){
    bool longMomentum = RequireBothMomentum ? (macdUp && rsiUp) : (macdUp || rsiUp);
    bool shortMomentum= RequireBothMomentum ? (macdDown && rsiDown) : (macdDown || rsiDown);
 
+   int stage_m = stage;
+   if(stage_m >= 2){
+      bool longOR  = (macdUp || rsiUp);
+      bool shortOR = (macdDown || rsiDown);
+      longMomentum  = longOR  && (rsi_curr >= RSI_Min_Long);
+      shortMomentum = shortOR && (rsi_curr <= RSI_Max_Short);
+   }
+
    double macdSig_1=0.0;
    if(!GetValue(hMACD_M15,1,1,macdSig_1)) macdSig_1=macd_curr;
    double macdHist_now = macd_curr - macdSig_1;
@@ -1312,14 +1359,6 @@ bool TryEnter(){
 
    longMomentum  = longMomentum  && macdRising  && rsiSlopeUp   && rsi_curr >= RSI_Min_Long;
    shortMomentum = shortMomentum && macdFalling && rsiSlopeDown && rsi_curr <= RSI_Max_Short;
-
-   // Stage-aware easing: at stage>=2 allow OR instead of AND
-   if(stage>=2){
-      bool longOR  = (macdUp || rsiUp);
-      bool shortOR = (macdDown || rsiDown);
-      longMomentum  = longOR  && macdRising  && rsiSlopeUp   && (rsi_curr >= RSI_Min_Long);
-      shortMomentum = shortOR && macdFalling && rsiSlopeDown && (rsi_curr <= RSI_Max_Short);
-   }
 
    bool pullLong = (m15[1].low <= emaPull_1) && ((emaPull_1 - m15[1].low) >= Min_Pull_Depth_ATR * atr);
    bool pullShort= (m15[1].high >= emaPull_1) && ((m15[1].high - emaPull_1) >= Min_Pull_Depth_ATR * atr);
@@ -1494,6 +1533,13 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
       double stopDistPrice=PriceFromPoints(stopPts);
       double lots=LotsByRiskSafe(stopPts);
       lots = ApplyFailSafeRisk(lots, failSafeActive);
+      if(gDayProbeUsed){
+         double minLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+         double stepLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+         double probe   = MathMax(minLot, DayGate_ProbeLots);
+         if(stepLot>0) probe = MathFloor(probe/stepLot)*stepLot;
+         lots = MathMax(lots, probe);
+      }
       if(lots<=0){ AppendReason(why,"noLots"); return LogAndReturnFalse(why); }
       NormalizeVolume(lots);
       double sl=NormalizePrice(ask-stopDistPrice);
@@ -1528,6 +1574,13 @@ bool ciOK = (ciMin <= 0.0) ? true : (ci >= ciMin);
       double stopDistPrice=PriceFromPoints(stopPts);
       double lots=LotsByRiskSafe(stopPts);
       lots = ApplyFailSafeRisk(lots, failSafeActive);
+      if(gDayProbeUsed){
+         double minLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+         double stepLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+         double probe   = MathMax(minLot, DayGate_ProbeLots);
+         if(stepLot>0) probe = MathFloor(probe/stepLot)*stepLot;
+         lots = MathMax(lots, probe);
+      }
       if(lots<=0){ AppendReason(why,"noLots"); return LogAndReturnFalse(why); }
       NormalizeVolume(lots);
       double sl=NormalizePrice(bid+stopDistPrice);
@@ -2667,6 +2720,8 @@ void OnTick(){
 
    if(!NewM15Bar()) return; // only evaluate entries once per new M15 bar
    if(LossStreak_Protection && cooldownBarsRemaining>0) cooldownBarsRemaining--;
+   // Reset probe flag each new bar to avoid affecting multiple orders the same day
+   if(gDayProbeUsed) gDayProbeUsed = false;
    barsProcessed++; bool verboseBar = (Enable_Diagnostics && Verbose_First_N && (barsProcessed <= (ulong)Verbose_Bars_Limit));
    if(Diagnostics) PrintStageInfo(LoosenStage());
 
