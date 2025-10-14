@@ -697,27 +697,33 @@ void ResetDailyCounters(){
 
 void CancelGatePendings()
 {
-   for(int i=OrdersTotal()-1; i>=0; --i)
+   // iterate orders by index -> get ticket -> select by ticket (MQL5 way)
+   for (int i = OrdersTotal() - 1; i >= 0; --i)
    {
-      if(!OrderSelect((uint)i, SELECT_BY_POS, MODE_TRADES)) continue;
-      if((ulong)OrderGetInteger(ORDER_MAGIC) != Magic) continue;
+      ulong ticket = OrderGetTicket(i);
+      if (ticket == 0)               continue;
+      if (!OrderSelect(ticket))      continue;
 
-      ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if ((ulong)OrderGetInteger(ORDER_MAGIC) != Magic) continue;
+
+      ENUM_ORDER_TYPE type  = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
       bool isPending = (type == ORDER_TYPE_BUY_LIMIT  || type == ORDER_TYPE_SELL_LIMIT ||
                         type == ORDER_TYPE_BUY_STOP   || type == ORDER_TYPE_SELL_STOP);
-      if(!isPending) continue;
+      if (!isPending) continue;
 
       ENUM_ORDER_STATE state = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
-      if(!(state == ORDER_STATE_PLACED || state == ORDER_STATE_STARTED)) continue;
+      if (!(state == ORDER_STATE_PLACED || state == ORDER_STATE_STARTED)) continue;
 
-      ulong ticket = (ulong)OrderGetInteger(ORDER_TICKET);
-      if(ticket==0) continue;
+      MqlTradeRequest req;  MqlTradeResult res;
+      ZeroMemory(req); ZeroMemory(res);
+      req.action = TRADE_ACTION_REMOVE;
+      req.order  = ticket;
 
-      MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
-      rq.action = TRADE_ACTION_REMOVE;
-      rq.order  = ticket;
-      if(!OrderSend(rq, rs) && Enable_Diagnostics)
-         PrintFormat("[CancelPend] ticket=%I64u failed, ret=%d", ticket, (int)rs.retcode);
+      if (!OrderSend(req, res))  // check return to clear the compiler warning
+      {
+         PrintFormat("[CancelGatePendings] REMOVE failed ticket=%I64u err=%d",
+                     ticket, GetLastError());
+      }
    }
 }
 
