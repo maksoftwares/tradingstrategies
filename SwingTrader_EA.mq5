@@ -12,7 +12,7 @@
 
 inline bool IsFiniteD(const double x)
 {
-   return MathIsValidNumber(x);
+   return (x==x) && (x!=DBL_MAX) && (x!=-DBL_MAX);
 }
 
 // --- Realized-R accounting and stall guards ---
@@ -26,7 +26,7 @@ double  g_lastOpenRiskR     = -1.0;
 int     g_openRiskFlatBars  = 0;
 
 input group "=== Build ==="
-input string   BuildTag         = "unblock_stage2_v2";
+input string   BuildTag         = "fix_lock_and_flow_v5";
 
 input group "=== Core Filters ==="
 input int      H1_EMA_Fast     = 50;
@@ -148,9 +148,9 @@ input double   RSI_Min_Long           = 51.5;   // slight push away from 50
 input double   RSI_Max_Short          = 48.5;
 
 input group "=== Candle Body Thresholds (stage-aware) ==="
-input double Body_Min_L0 = 0.35;   // body/range minimum at stage 0
-input double Body_Min_L1 = 0.30;   // stage 1
-input double Body_Min_L2 = 0.25;   // stage 2 (looser late session)
+input double BodyMin_L0 = 0.30;   // base: body ≥30% of range
+input double BodyMin_L1 = 0.25;   // stage 1 midpoint
+input double BodyMin_L2 = 0.20;   // relaxed late-session threshold
 
 input group "=== Pullback / Structure Quality ==="
 input double   Min_Pull_Depth_ATR     = 0.12;   // tighten pullback depth slightly
@@ -215,10 +215,13 @@ input bool   ZeroRisk_When_BE        = true;   // if SL at/through BE => zero ri
 input int    OpenRisk_IdleUnlockBars = 48;     // unlock if open-risk unchanged ~12h (M15)
 input bool   Log_OpenRisk            = true;
 
-input group "=== Realized R Caps (day/week) ==="
+input group "=== Risk Gate (Realized R) ==="
 input bool   RiskGate_Enable         = true;
-input double RiskGate_MinR_Day       = -2.0;   // lock rest of day if below
-input double RiskGate_MinR_Week      = -5.0;   // lock until new week if below
+input double RiskGate_MinR_Day       = -3.0;   // lock rest of day if below
+input double RiskGate_MinR_Week      = -12.0;  // lock until new week if below
+input int    RiskGate_Unlock_NoTradeBars = 96; // force unlock after ~1 day idle
+input bool   RiskGate_ProbeOnce      = true;
+input double RiskGate_ProbeLots      = 0.01;
 
 input group "=== Adaptive Frequency Layer ==="
 input bool   AdaptiveLoosen     = true;
@@ -227,19 +230,14 @@ input int    LoosenHour1        = 12;
 input int    LoosenHour2        = 16;
 input int    ADX_Min_L0         = 18;
 input int    ADX_Min_L1         = 16;
-input int    ADX_Min_L2         = 14;
+input int    ADX_Min_L2         = 12;
 input double CI_Max_L0          = 50.0;  // compression index max stage 0
 input double CI_Max_L1          = 60.0;  // compression index max stage 1
-input double CI_Max_L2          = 70.0;  // compression index max stage 2
+input double CI_Max_L2          = 80.0;  // compression index max stage 2
 input double MinSpace_ATR_L0    = 0.80;
 input double MinSpace_ATR_L1    = 0.60;
-input double MinSpace_ATR_L2    = 0.35;   // eased late-stage
+input double MinSpace_ATR_L2    = 0.30;   // eased late-stage
 input int    RSI_Mid_L2         = 49;    // slightly easier RSI midline at stage 2
-
-input group "=== Day Gate Idle/Probe ==="
-input int    DayGate_IdleUnlockBars = 64;   // ~16h on M15; unlock the day if no trades for long
-input bool   DayGate_ProbeOnce      = true; // allow exactly one micro-lot probe after idle unlock
-input double DayGate_ProbeLots      = 0.01; // lot size for probe (if used)
 
 input group "=== Equity Gate & Probe Lane ==="
 input bool     Use_EquityGate          = false;  // If true, pause entries when recent win-rate is poor, but auto-grace after N bars.
@@ -311,8 +309,7 @@ CPositionInfo positionInfo;
 
 //--- state
 // day gate probe state
-bool     gDayProbeUsed = false;
-bool     gDayProbeConsumed = false;
+bool     gProbeUsedToday = false;
 bool     gFallbackAttempted = false; // late-day permissive try flag
 datetime lastM15BarTime = 0;
 bool     partialTaken   = false;
@@ -411,6 +408,7 @@ void ResetRiskWindowsIfNeeded();
 double CurrentRiskPercent();
 bool CapsAllowTrading(bool &probe_mode_out);
 void BumpProbeCounter(bool probe_mode);
+void CancelGatePendings();
 bool TryEnter_WithProbe(bool probe_mode);
 void LogClosedDeal(ulong d);
 
@@ -662,14 +660,13 @@ double NormalizePrice(double p){
    return NormalizeDouble(p,(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS));
 }
 
-// yyyymmdd and yyyyWW (coarse) without TimeDayOfYear dependency
-// Return yyyymmdd and yyyyWW (coarse) for supplied time
+// Return yyyymmdd and yyyyWW(approx) for supplied time without TimeDayOfYear()
 void DayWeekIds(const datetime t, int &d_out, int &w_out){
    MqlDateTime dt; TimeToStruct(t, dt);
    d_out = dt.year*10000 + dt.mon*100 + dt.day;
    MqlDateTime jan1; jan1.year=dt.year; jan1.mon=1; jan1.day=1; jan1.hour=0; jan1.min=0; jan1.sec=0;
-   datetime d0 = StructToTime(jan1);
-   int doy = (int)((t - d0)/86400) + 1; // 1..366
+   datetime base = StructToTime(jan1);
+   int doy = int((t - base) / 86400) + 1;
    int wnum = doy / 7;
    w_out = dt.year*100 + wnum;
 }
@@ -685,8 +682,7 @@ void ResetDailyCounters(){
       consecutiveLosses=0;
       dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
       R_today = 0.0;
-      gDayProbeUsed = false;
-      gDayProbeConsumed = false;
+      gProbeUsedToday=false;
       gFallbackAttempted = false;
    }
    if(gWeekId!=wId){
@@ -694,6 +690,26 @@ void ResetDailyCounters(){
       gR_week=0.0;
       weekStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
       R_week = 0.0;
+      lastWeekId = wId;
+   }
+}
+
+void CancelGatePendings(){
+   for(int i=OrdersTotal()-1; i>=0; --i){
+      if(!OrderSelect((uint)i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != Magic) continue;
+      ENUM_ORDER_TYPE t = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      bool pend = (t==ORDER_TYPE_BUY_LIMIT || t==ORDER_TYPE_SELL_LIMIT ||
+                   t==ORDER_TYPE_BUY_STOP  || t==ORDER_TYPE_SELL_STOP);
+      if(!pend) continue;
+      ENUM_ORDER_STATE st = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
+      if(st!=ORDER_STATE_PLACED && st!=ORDER_STATE_STARTED) continue;
+      ulong ticket = (ulong)OrderGetInteger(ORDER_TICKET);
+      if(ticket==0) continue;
+      MqlTradeRequest rr; MqlTradeResult rs; ZeroMemory(rr); ZeroMemory(rs);
+      rr.action = TRADE_ACTION_REMOVE;
+      rr.order  = ticket;
+      OrderSend(rr, rs);
    }
 }
 
@@ -1214,23 +1230,31 @@ bool TryEnter_WithProbe(bool probe_mode){
 
 bool TryEnter(){
    ResetDailyCounters();
-   bool dayLocked=false, weekLocked=false, unlockNow=false;
+   bool allowProbe=false;
    if(RiskGate_Enable){
-      dayLocked  = (gR_day  <= RiskGate_MinR_Day);
-      weekLocked = (gR_week <= RiskGate_MinR_Week);
-      int barsIdle = 0;
+      static int barsSinceTrade=0;
       if(gLastTradeTime>0)
-         barsIdle = (int)((TimeCurrent() - gLastTradeTime)/PeriodSeconds(PERIOD_M15));
-      unlockNow = (barsIdle >= MathMax(DayGate_IdleUnlockBars, 0));
-   }
-   if(RiskGate_Enable){
-      if(weekLocked) return LogAndReturnFalse("riskGate-week");
-      if(dayLocked && !unlockNow) return LogAndReturnFalse("riskGate-day");
-      if(dayLocked && unlockNow && DayGate_ProbeOnce && !gDayProbeConsumed){
-         if(Enable_Diagnostics)
-            Print("[Gate] Day locked but idle-unlock active => allow one probe trade");
-         gDayProbeUsed = true;
-         gDayProbeConsumed = true;
+         barsSinceTrade = int((TimeCurrent()-gLastTradeTime)/PeriodSeconds(PERIOD_M15));
+      else
+         barsSinceTrade++;
+
+      bool weekBlocked = (gR_week <= RiskGate_MinR_Week);
+      bool dayBlocked  = (gR_day  <= RiskGate_MinR_Day);
+
+      if(weekBlocked || dayBlocked){
+         bool idleUnlock = (barsSinceTrade >= MathMax(RiskGate_Unlock_NoTradeBars,0));
+         if(idleUnlock){
+            if(Enable_Diagnostics)
+               PrintFormat("[Gate] Idle unlock after %d bars (R_day=%.2f R_week=%.2f)", barsSinceTrade, gR_day, gR_week);
+         } else {
+            if(RiskGate_ProbeOnce && !gProbeUsedToday){
+               CancelGatePendings();
+               allowProbe = true;
+            } else {
+               CancelGatePendings();
+               return LogAndReturnFalse(weekBlocked ? "riskGate-week" : "riskGate-day");
+            }
+         }
       }
    }
    if(LossStreak_Protection && cooldownBarsRemaining>0){
@@ -1281,10 +1305,10 @@ bool TryEnter(){
    double body = MathAbs(m15[1].close - m15[1].open);
    double range= (m15[1].high - m15[1].low);
    int stage_b = LoosenStage();
-   double minBodyFrac = (stage_b==0 ? 0.33 : 0.22);
+   double bodyMin = (stage_b>=2 ? BodyMin_L2 : (stage_b==1 ? BodyMin_L1 : BodyMin_L0));
    if(fallbackActive)
-      minBodyFrac = MathMin(minBodyFrac, 0.18);
-   bool   bodyOK = (range>0 && (body/range) >= minBodyFrac);
+      bodyMin = MathMin(bodyMin, BodyMin_L2);
+   bool   bodyOK = (range>0 && (body/range) >= bodyMin);
    if(!bodyOK) { AppendReason(why,"weakBody"); return LogAndReturnFalse(why); }
    double atr;
    if(!GetValue(hATR_M15,0,1,atr)) { AppendReason(why,"atr"); return LogAndReturnFalse(why); }
@@ -1584,7 +1608,7 @@ if(fallbackActive)
       if(!strengthDown) AppendReason(why,"adxShort");
       if(!ciOK) AppendReason(why,"ci");
       // If no normal entry and day is dry, place one strict reduced-risk probe
-      if(Enable_Probe_Trade && TradesToday<DailyMinTrades){
+      if(!allowProbe && Enable_Probe_Trade && TradesToday<DailyMinTrades){
          // accelerate looseness by bar-drought, not only by clock
          if(BarsSinceLastEntry() >= 64){
             if(EnforceProbeTrade()) return true;
@@ -1593,7 +1617,7 @@ if(fallbackActive)
       return LogAndReturnFalse(why);
    }
 
-   if(Enable_Daily_Min_Trade && TradesToday < DailyMinTrades){
+   if(!allowProbe && Enable_Daily_Min_Trade && TradesToday < DailyMinTrades){
       if(EnforceDailyTradeQuota()) return true;
    }
 
@@ -1615,12 +1639,13 @@ if(fallbackActive)
       double stopDistPrice=PriceFromPoints(stopPts);
       double lots=LotsByRiskSafe(stopPts);
       lots = ApplyFailSafeRisk(lots, failSafeActive);
-      if(gDayProbeUsed){
+      if(allowProbe){
          double minLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
          double stepLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
-         double probe   = MathMax(minLot, DayGate_ProbeLots);
-         if(stepLot>0) probe = MathFloor(probe/stepLot)*stepLot;
-         lots = MathMax(lots, probe);
+         double probe   = MathMax(minLot, MathMin(lots, RiskGate_ProbeLots));
+         if(stepLot>0)
+            probe = MathFloor(probe/stepLot)*stepLot;
+         lots = MathMax(minLot, probe);
       }
       if(lots<=0){ AppendReason(why,"noLots"); return LogAndReturnFalse(why); }
       NormalizeVolume(lots);
@@ -1633,11 +1658,19 @@ if(fallbackActive)
          MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
          rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_BUY_STOP; rq.symbol=_Symbol; rq.volume=lots; rq.price=pendingPrice; rq.sl=sl; rq.tp=tp; rq.magic=Magic; rq.deviation=50; rq.type_filling=ORDER_FILLING_FOK;
          if(SafeOrderSend(rq,rs)){
+            if(allowProbe){
+               gProbeUsedToday = true;
+               if(Enable_Diagnostics) Print("[Probe] using micro-lot due to gate");
+            }
             pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=1; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=stopPts; entryATRPoints=atrPts; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; probeStopPts=0.0; probeBarsSinceEntry=0; return true;
          } else AppendReason(why,"buyStopFail");
       } else {
          trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50);
          if(trade.Buy(lots,NULL,ask,sl,tp,"NF_Long")){
+            if(allowProbe){
+               gProbeUsedToday = true;
+               if(Enable_Diagnostics) Print("[Probe] using micro-lot due to gate");
+            }
             partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atrPts; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; TradesToday++; probeStopPts=0.0; probeBarsSinceEntry=0; return true;
          } else AppendReason(why,"buyFail");
       }
@@ -1656,12 +1689,13 @@ if(fallbackActive)
       double stopDistPrice=PriceFromPoints(stopPts);
       double lots=LotsByRiskSafe(stopPts);
       lots = ApplyFailSafeRisk(lots, failSafeActive);
-      if(gDayProbeUsed){
+      if(allowProbe){
          double minLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
          double stepLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
-         double probe   = MathMax(minLot, DayGate_ProbeLots);
-         if(stepLot>0) probe = MathFloor(probe/stepLot)*stepLot;
-         lots = MathMax(lots, probe);
+         double probe   = MathMax(minLot, MathMin(lots, RiskGate_ProbeLots));
+         if(stepLot>0)
+            probe = MathFloor(probe/stepLot)*stepLot;
+         lots = MathMax(minLot, probe);
       }
       if(lots<=0){ AppendReason(why,"noLots"); return LogAndReturnFalse(why); }
       NormalizeVolume(lots);
@@ -1673,15 +1707,26 @@ if(fallbackActive)
          MqlTradeRequest rq; MqlTradeResult rs; ZeroMemory(rq); ZeroMemory(rs);
          rq.action=TRADE_ACTION_PENDING; rq.type=ORDER_TYPE_SELL_STOP; rq.symbol=_Symbol; rq.volume=lots; rq.price=pendingPrice; rq.sl=sl; rq.tp=tp; rq.magic=Magic; rq.deviation=50; rq.type_filling=ORDER_FILLING_FOK;
          if(SafeOrderSend(rq,rs)){
+            if(allowProbe){
+               gProbeUsedToday = true;
+               if(Enable_Diagnostics) Print("[Probe] using micro-lot due to gate");
+            }
             pendingTicket=rs.order; pendingExpiryBars=PendingOrder_Expiry_Bars; pendingDirection=0; signalHigh=m15[1].high; signalLow=m15[1].low; entryStopPoints=stopPts; entryATRPoints=atrPts; entryTime=TimeCurrent(); structureBreakOccurred=false; beMoved=false; probeStopPts=0.0; probeBarsSinceEntry=0; return true;
          } else AppendReason(why,"sellStopFail");
       } else {
          trade.SetExpertMagicNumber(Magic); trade.SetDeviationInPoints(50);
          if(trade.Sell(lots,NULL,bid,sl,tp,"NF_Short")){
+            if(allowProbe){
+               gProbeUsedToday = true;
+               if(Enable_Diagnostics) Print("[Probe] using micro-lot due to gate");
+            }
             partialTaken=false; secondPartialTaken=false; entryTime=TimeCurrent(); entryStopPoints=stopPts; entryATRPoints=atrPts; signalHigh=m15[1].high; signalLow=m15[1].low; structureBreakOccurred=false; beMoved=false; TradesToday++; probeStopPts=0.0; probeBarsSinceEntry=0; return true;
          } else AppendReason(why,"sellFail");
       }
    }
+
+   if(allowProbe)
+      return LogAndReturnFalse(why);
 
    // Secondary continuation-style permissive path (only if stage>0 and still below daily min trades)
    if(EnableAltSignal && stage>0 && TradesToday < DailyMinTrades){
@@ -1966,11 +2011,11 @@ if(fallbackActive)
 bool LogAndReturnFalse(const string why){
    if(Diagnostics && StringLen(why)>0){
       int stage = LoosenStage();
-      double bodyMinLog = (stage==0 ? 0.33 : 0.22);
+      double bodyMinLog = (stage>=2 ? BodyMin_L2 : (stage==1 ? BodyMin_L1 : BodyMin_L0));
       double spaceBase = (stage==2? MinSpace_ATR_L2 : stage==1? MinSpace_ATR_L1 : MinSpace_ATR_L0);
       double spaceMinLog = (stage==0 ? spaceBase : MathMin(spaceBase, 0.20));
       if(TradesToday==0 && gFallbackAttempted){
-         bodyMinLog = MathMin(bodyMinLog, 0.18);
+         bodyMinLog = MathMin(bodyMinLog, BodyMin_L2);
          spaceMinLog = 0.0;
       }
       PrintFormat("NO-ENTRY %s %s stage=%d body>=%.2f space>=%.2f : %s",
@@ -2734,13 +2779,17 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& 
                  + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
                  + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
    double oneR = OneRCashNow();
-   if(oneR>0.0){
-      double r = profit / oneR;
-      if(r==r){
-         gR_day += r;
-         gR_week += r;
-      }
-   }
+   double r = 0.0;
+   if(oneR>0.0)
+      r = profit / oneR;
+   if(!MathIsValidNumber(r) || !IsFiniteD(r))
+      r = 0.0;
+   gR_day  += r;
+   gR_week += r;
+   if(!MathIsValidNumber(gR_day)  || !IsFiniteD(gR_day))
+      gR_day = 0.0;
+   if(!MathIsValidNumber(gR_week) || !IsFiniteD(gR_week))
+      gR_week = 0.0;
    R_today = gR_day;
    R_week  = gR_week;
    gLastTradeTime = TimeCurrent();
@@ -2820,8 +2869,6 @@ void OnTick(){
 
    if(!NewM15Bar()) return; // only evaluate entries once per new M15 bar
    if(LossStreak_Protection && cooldownBarsRemaining>0) cooldownBarsRemaining--;
-   // Reset probe flag each new bar to avoid affecting multiple orders the same day
-   if(gDayProbeUsed) gDayProbeUsed = false;
    barsProcessed++; bool verboseBar = (Enable_Diagnostics && Verbose_First_N && (barsProcessed <= (ulong)Verbose_Bars_Limit));
    if(Diagnostics) PrintStageInfo(LoosenStage());
 
