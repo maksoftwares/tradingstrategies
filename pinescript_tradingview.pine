@@ -1,0 +1,452 @@
+//@version=6
+indicator("MasterScalpTrader 1H Signals", overlay=true, max_labels_count=500)
+
+// ============================================================================
+// INPUT PARAMETERS
+// ============================================================================
+
+// Moving Averages
+fastEMA_period = input.int(12, "Fast EMA Period", group="Moving Averages")
+slowEMA_period = input.int(26, "Slow EMA Period", group="Moving Averages")
+hullMA_period = input.int(21, "Hull MA Period", group="Moving Averages")
+trendMA_period = input.int(50, "Trend MA Period", group="Moving Averages")
+
+// Exit Line Settings
+exit_atr_multiplier = input.float(2.0, "Exit ATR Multiplier", minval=0.5, maxval=5.0, step=0.5, group="Exit Line")
+exit_line_smoothing = input.int(5, "Exit Line Smoothing Period", minval=1, maxval=20, group="Exit Line")
+show_exit_line = input.bool(true, "Show Exit Line", group="Exit Line")
+show_exit_signals = input.bool(true, "Show Exit Signals", group="Exit Line")
+
+// RSI Settings
+rsi_period = input.int(14, "RSI Period", group="RSI Settings")
+rsi_overbought = input.float(70, "RSI Overbought Level", group="RSI Settings")
+rsi_oversold = input.float(30, "RSI Oversold Level", group="RSI Settings")
+
+// MACD Settings
+macd_fast = input.int(12, "MACD Fast Period", group="MACD Settings")
+macd_slow = input.int(26, "MACD Slow Period", group="MACD Settings")
+macd_signal = input.int(9, "MACD Signal Period", group="MACD Settings")
+
+// Bollinger Bands
+bb_period = input.int(20, "BB Period", group="Bollinger Bands")
+bb_deviation = input.float(2.0, "BB Standard Deviation", group="Bollinger Bands")
+
+// Volume & Trend Filter
+volume_period = input.int(50, "Volume MA Period", group="Volume & Trend")
+volume_multiplier = input.float(1.5, "Volume Spike Multiplier", group="Volume & Trend")
+use_trend_filter = input.bool(true, "Enable Trend Filter", group="Volume & Trend")
+
+// Signal Confidence
+min_confidence = input.int(55, "Minimum Confidence %", minval=0, maxval=100, group="Signal Confidence")
+agressive_mode = input.bool(false, "Aggressive Mode (Earlier Signals)", group="Signal Confidence")
+realtime_signals = input.bool(true, "Real-Time Signals (Don't Wait for Bar Close)", group="Signal Confidence")
+
+// Display Options
+show_buy_signals = input.bool(true, "Show Buy Signals", group="Display")
+show_sell_signals = input.bool(true, "Show Sell Signals", group="Display")
+show_confidence = input.bool(true, "Show Confidence %", group="Display")
+show_trigger_count = input.bool(true, "Show Trigger Count", group="Display")
+label_size = input.string("small", "Label Size", options=["tiny", "small", "normal", "large"], group="Display")
+
+// Colors
+buy_color = input.color(color.new(color.lime, 0), "Buy Signal Color", group="Colors")
+sell_color = input.color(color.new(color.red, 0), "Sell Signal Color", group="Colors")
+
+// ============================================================================
+// INDICATORS CALCULATION
+// ============================================================================
+
+// Moving Averages
+fastEMA = ta.ema(close, fastEMA_period)
+slowEMA = ta.ema(close, slowEMA_period)
+trendMA = ta.sma(close, trendMA_period)
+
+// Hull MA Calculation
+hullMA = ta.wma(2 * ta.wma(close, hullMA_period / 2) - ta.wma(close, hullMA_period), math.round(math.sqrt(hullMA_period)))
+
+// RSI
+rsi = ta.rsi(close, rsi_period)
+
+// MACD
+[macdLine, signalLine, macdHist] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+
+// ATR
+atr = ta.atr(14)
+
+// Bollinger Bands
+[bbMiddle, bbUpper, bbLower] = ta.bb(close, bb_period, bb_deviation)
+
+// Volume
+volumeMA = ta.sma(volume, volume_period)
+
+// Exit Line Calculation (Dynamic based on ATR and trend)
+exitOffset = atr * exit_atr_multiplier
+rawExitLine = close > trendMA ? close - exitOffset : close + exitOffset
+exitLine = ta.sma(rawExitLine, exit_line_smoothing)
+
+// ============================================================================
+// MARKET CONDITIONS
+// ============================================================================
+
+// Trend Conditions
+maTrendUp = fastEMA > slowEMA and close > hullMA
+maTrendDown = fastEMA < slowEMA and close < hullMA
+
+bullTrend = close > trendMA and trendMA > trendMA[3]
+bearTrend = close < trendMA and trendMA < trendMA[3]
+
+// RSI Conditions
+rsiMomentum = rsi - rsi[1]
+rsiDivergenceBull = low < low[1] and rsi > rsi[1]
+rsiDivergenceBear = high > high[1] and rsi < rsi[1]
+
+// MACD Conditions
+macdTurnUp = (macdHist > 0 and macdHist > macdHist[1]) or (macdHist[1] < 0 and macdHist > 0)
+macdTurnDn = (macdHist < 0 and macdHist < macdHist[1]) or (macdHist[1] > 0 and macdHist < 0)
+
+macdCrossUp = ta.crossover(macdLine, signalLine)
+macdCrossDn = ta.crossunder(macdLine, signalLine)
+
+// Volume
+volSpike = volume > volumeMA * volume_multiplier
+
+// Bollinger Bands
+nearUpper = close >= bbUpper - 0.35 * (bbUpper - bbMiddle)
+nearLower = close <= bbLower + 0.35 * (bbMiddle - bbLower)
+
+// Candle Strength
+candleRange = high - low
+priceStrength = candleRange > 0 ? (close - open) / candleRange : 0
+bullCandle = close > open and priceStrength > 0.5
+bearCandle = close < open and priceStrength < -0.5
+
+// Price Exhaustion (for catching tops/bottoms)
+wickSize = high - low
+bodySize = math.abs(close - open)
+hasLargeWick = wickSize > bodySize * 2  // Wick must be 2x body size
+
+bullishExhaustion = close < open and high > high[1] and rsi > 65 and hasLargeWick  // Stricter: RSI>65, large wick
+bearishExhaustion = close > open and low < low[1] and rsi < 35 and hasLargeWick   // Stricter: RSI<35, large wick
+
+// ============================================================================
+// BUY SIGNALS (5 Triggers)
+// ============================================================================
+
+buySignal1 = rsi < rsi_oversold and rsiMomentum > 0
+buySignal2 = macdCrossUp or macdTurnUp
+buySignal3 = rsiDivergenceBull
+buySignal4 = nearLower and close > fastEMA
+buySignal5 = close > trendMA and macdHist > 0 and macdHist[1] <= 0
+buySignal6 = bearishExhaustion  // New: catch bounce from bottom
+
+longTriggers = (buySignal1 ? 1 : 0) + (buySignal2 ? 1 : 0) + (buySignal3 ? 1 : 0) + (buySignal4 ? 1 : 0) + (buySignal5 ? 1 : 0) + (buySignal6 ? 1 : 0)
+
+minTriggersRequired = agressive_mode ? 2 : 3
+buyTrendOk = not use_trend_filter or (maTrendUp and bullTrend and close > trendMA)
+buyReversal = not buyTrendOk and longTriggers >= 3 and ((rsi <= rsi_oversold - 5.0 and bearishExhaustion) or (rsiDivergenceBull and macdTurnUp and nearLower))
+buyCondCore = longTriggers >= 3 and (buyTrendOk or buyReversal)  // Always require 3+ triggers
+
+// ============================================================================
+// SELL SIGNALS (5 Triggers)
+// ============================================================================
+
+sellSignal1 = rsi > rsi_overbought and rsiMomentum < 0
+sellSignal2 = macdCrossDn or macdTurnDn
+sellSignal3 = rsiDivergenceBear
+sellSignal4 = nearUpper and close < fastEMA
+sellSignal5 = close < trendMA and macdHist < 0 and macdHist[1] >= 0
+sellSignal6 = bullishExhaustion  // New: catch rejection from top
+
+shortTriggers = (sellSignal1 ? 1 : 0) + (sellSignal2 ? 1 : 0) + (sellSignal3 ? 1 : 0) + (sellSignal4 ? 1 : 0) + (sellSignal5 ? 1 : 0) + (sellSignal6 ? 1 : 0)
+
+sellTrendOk = not use_trend_filter or (maTrendDown and bearTrend and close < trendMA)
+sellReversal = not sellTrendOk and shortTriggers >= 3 and ((rsi >= rsi_overbought + 5.0 and bullishExhaustion) or (rsiDivergenceBear and macdTurnDn and nearUpper))
+sellCondCore = shortTriggers >= 3 and (sellTrendOk or sellReversal)  // Always require 3+ triggers
+
+// ============================================================================
+// CONFIDENCE SCORING
+// ============================================================================
+
+oversoldDepth = math.max(0.0, (rsi_oversold - rsi) * 1.8)
+overboughtDepth = math.max(0.0, (rsi - rsi_overbought) * 1.8)
+
+// Long Score Calculation
+var float longScore = 0.0
+if buyCondCore
+    longScore := 24.0
+    longScore += longTriggers * 7.0
+    longScore += longTriggers >= 3 ? 5.0 : 0.0
+    longScore -= longTriggers == 1 ? 5.0 : 0.0
+    longScore += math.min(16.0, oversoldDepth)
+    longScore += buyReversal ? 6.0 : 0.0
+    longScore += macdTurnUp ? 10.0 : 0.0
+    longScore += macdCrossUp ? 12.0 : 0.0
+    longScore += rsiDivergenceBull ? 10.0 : 0.0
+    longScore += nearLower ? 8.0 : 0.0
+    longScore += bullCandle ? 6.0 : 0.0
+    longScore += volSpike and bullCandle ? 5.0 : 0.0
+    longScore += maTrendUp ? 8.0 : 0.0
+    longScore += bullTrend ? 8.0 : 0.0
+    longScore += close > hullMA ? 4.0 : 0.0
+    longScore += priceStrength > 0.3 ? 4.0 : 0.0
+    longScore += bearishExhaustion ? 12.0 : 0.0  // Strong reversal signal
+    
+    // Penalties
+    longScore -= maTrendDown ? (buyReversal ? 4.0 : 9.0) : 0.0
+    longScore -= bearTrend ? (buyReversal ? 3.0 : 7.0) : 0.0
+    longScore -= nearUpper and not buyReversal ? 6.0 : 0.0
+    longScore -= macdTurnDn and not buyReversal ? 5.0 : 0.0
+    longScore -= macdCrossDn and not buyReversal ? 5.0 : 0.0
+    longScore -= bearCandle and not buyReversal ? 6.0 : 0.0
+    
+    longScore := math.min(100.0, math.max(0.0, longScore))
+else
+    longScore := 0.0
+
+// Short Score Calculation
+var float shortScore = 0.0
+if sellCondCore
+    shortScore := 24.0
+    shortScore += shortTriggers * 7.0
+    shortScore += shortTriggers >= 3 ? 5.0 : 0.0
+    shortScore -= shortTriggers == 1 ? 5.0 : 0.0
+    shortScore += math.min(16.0, overboughtDepth)
+    shortScore += sellReversal ? 6.0 : 0.0
+    shortScore += macdTurnDn ? 10.0 : 0.0
+    shortScore += macdCrossDn ? 12.0 : 0.0
+    shortScore += rsiDivergenceBear ? 10.0 : 0.0
+    shortScore += nearUpper ? 8.0 : 0.0
+    shortScore += bearCandle ? 6.0 : 0.0
+    shortScore += volSpike and bearCandle ? 5.0 : 0.0
+    shortScore += maTrendDown ? 8.0 : 0.0
+    shortScore += bearTrend ? 8.0 : 0.0
+    shortScore += close < hullMA ? 4.0 : 0.0
+    shortScore += priceStrength < -0.3 ? 4.0 : 0.0
+    shortScore += bullishExhaustion ? 12.0 : 0.0  // Strong reversal signal
+    
+    // Penalties
+    shortScore -= maTrendUp ? (sellReversal ? 4.0 : 9.0) : 0.0
+    shortScore -= bullTrend ? (sellReversal ? 3.0 : 7.0) : 0.0
+    shortScore -= nearLower and not sellReversal ? 6.0 : 0.0
+    shortScore -= macdTurnUp and not sellReversal ? 5.0 : 0.0
+    shortScore -= macdCrossUp and not sellReversal ? 5.0 : 0.0
+    shortScore -= bullCandle and not sellReversal ? 6.0 : 0.0
+    
+    shortScore := math.min(100.0, math.max(0.0, shortScore))
+else
+    shortScore := 0.0
+
+confLong = math.round(longScore)
+confShort = math.round(shortScore)
+
+// ============================================================================
+// DYNAMIC CONFIDENCE THRESHOLDS
+// ============================================================================
+
+// Aggressive mode adjustments
+penaltyMultiplier = agressive_mode ? 0.5 : 1.0
+bonusMultiplier = agressive_mode ? 1.5 : 1.0
+
+var float tempConfLong = min_confidence
+tempConfLong := min_confidence
+tempConfLong += longTriggers >= 6 ? -12 * bonusMultiplier : longTriggers >= 5 ? -8 * bonusMultiplier : longTriggers >= 4 ? -4 * bonusMultiplier : longTriggers == 3 ? 0 : 15 * penaltyMultiplier
+tempConfLong += oversoldDepth > 15.0 ? -5 * bonusMultiplier : 0
+tempConfLong += volSpike and bullCandle ? -3 * bonusMultiplier : 0
+tempConfLong += buyReversal ? 2 * penaltyMultiplier : 0
+tempConfLong += not buyTrendOk and not buyReversal ? 8 * penaltyMultiplier : 0
+tempConfLong := math.max(25, math.min(85, tempConfLong))
+dynamicMinConfLong = math.round(tempConfLong)
+
+var float tempConfShort = min_confidence
+tempConfShort := min_confidence
+tempConfShort += shortTriggers >= 6 ? -12 * bonusMultiplier : shortTriggers >= 5 ? -8 * bonusMultiplier : shortTriggers >= 4 ? -4 * bonusMultiplier : shortTriggers == 3 ? 0 : 15 * penaltyMultiplier
+tempConfShort += overboughtDepth > 15.0 ? -5 * bonusMultiplier : 0
+tempConfShort += volSpike and bearCandle ? -3 * bonusMultiplier : 0
+tempConfShort += sellReversal ? 2 * penaltyMultiplier : 0
+tempConfShort += not sellTrendOk and not sellReversal ? 8 * penaltyMultiplier : 0
+tempConfShort := math.max(25, math.min(85, tempConfShort))
+dynamicMinConfShort = math.round(tempConfShort)
+
+// ============================================================================
+// FINAL SIGNALS
+// ============================================================================
+
+longEligible = buyCondCore and confLong >= dynamicMinConfLong
+shortEligible = sellCondCore and confShort >= dynamicMinConfShort
+
+var int finalSignal = 0
+var int finalConfidence = 0
+
+if longEligible or shortEligible
+    if longEligible and (not shortEligible or confLong > confShort)
+        finalSignal := 1
+        finalConfidence := confLong
+    else if shortEligible and (not longEligible or confShort > confLong)
+        finalSignal := -1
+        finalConfidence := confShort
+    else if longEligible and shortEligible and confLong == confShort
+        if longTriggers > shortTriggers
+            finalSignal := 1
+            finalConfidence := confLong
+        else if shortTriggers > longTriggers
+            finalSignal := -1
+            finalConfidence := confShort
+        else if priceStrength > 0
+            finalSignal := 1
+            finalConfidence := confLong
+        else if priceStrength < 0
+            finalSignal := -1
+            finalConfidence := confShort
+        else
+            finalSignal := 0
+            finalConfidence := 0
+    else
+        finalSignal := 0
+        finalConfidence := 0
+else
+    finalSignal := 0
+    finalConfidence := 0
+
+// ============================================================================
+// EXIT DETECTION
+// ============================================================================
+
+// Exit conditions based on price touching/crossing the exit line
+isLongExit = close <= exitLine and close[1] > exitLine[1] and close > trendMA
+isShortExit = close >= exitLine and close[1] < exitLine[1] and close < trendMA
+
+// ============================================================================
+// PLOT SIGNALS
+// ============================================================================
+
+// Buy Signal
+isBuySignal = finalSignal == 1
+if isBuySignal and show_buy_signals
+    priceStr = str.tostring(close, format.mintick)
+    labelText = "BUY @ " + priceStr
+    if show_confidence and show_trigger_count
+        labelText := "BUY @ " + priceStr + "\n" + str.tostring(finalConfidence) + "% | " + str.tostring(longTriggers) + "/6"
+    else if show_confidence
+        labelText := "BUY @ " + priceStr + "\n" + str.tostring(finalConfidence) + "%"
+    else if show_trigger_count
+        labelText := "BUY @ " + priceStr + "\n" + str.tostring(longTriggers) + "/6"
+    
+    label.new(bar_index, low, 
+              text=labelText, 
+              style=label.style_label_up, 
+              color=buy_color, 
+              textcolor=color.white, 
+              size=label_size == "tiny" ? size.tiny : label_size == "small" ? size.small : label_size == "normal" ? size.normal : size.large,
+              yloc=yloc.belowbar)
+
+// Sell Signal
+isSellSignal = finalSignal == -1
+if isSellSignal and show_sell_signals
+    priceStr = str.tostring(close, format.mintick)
+    labelText = "SELL @ " + priceStr
+    if show_confidence and show_trigger_count
+        labelText := "SELL @ " + priceStr + "\n" + str.tostring(finalConfidence) + "% | " + str.tostring(shortTriggers) + "/6"
+    else if show_confidence
+        labelText := "SELL @ " + priceStr + "\n" + str.tostring(finalConfidence) + "%"
+    else if show_trigger_count
+        labelText := "SELL @ " + priceStr + "\n" + str.tostring(shortTriggers) + "/6"
+    
+    label.new(bar_index, high, 
+              text=labelText, 
+              style=label.style_label_down, 
+              color=sell_color, 
+              textcolor=color.white, 
+              size=label_size == "tiny" ? size.tiny : label_size == "small" ? size.small : label_size == "normal" ? size.normal : size.large,
+              yloc=yloc.abovebar)
+
+// Exit Signals
+if isLongExit and show_exit_signals
+    label.new(bar_index, high, 
+              text="EXIT", 
+              style=label.style_xcross, 
+              color=color.new(color.orange, 30), 
+              textcolor=color.white, 
+              size=size.small,
+              yloc=yloc.abovebar)
+
+if isShortExit and show_exit_signals
+    label.new(bar_index, low, 
+              text="EXIT", 
+              style=label.style_xcross, 
+              color=color.new(color.orange, 30), 
+              textcolor=color.white, 
+              size=size.small,
+              yloc=yloc.belowbar)
+
+// ============================================================================
+// PLOT MOVING AVERAGES (Optional)
+// ============================================================================
+
+plot(fastEMA, "Fast EMA", color=color.new(color.blue, 0), linewidth=1)
+plot(slowEMA, "Slow EMA", color=color.new(color.orange, 0), linewidth=1)
+plot(hullMA, "Hull MA", color=color.new(color.purple, 0), linewidth=2)
+plot(trendMA, "Trend MA", color=color.new(color.yellow, 0), linewidth=2)
+
+// Exit Line (Color changes based on trend)
+exitLineColor = close > trendMA ? color.new(color.red, 30) : color.new(color.green, 30)
+plot(show_exit_line ? exitLine : na, "Exit Line", color=exitLineColor, linewidth=2, style=plot.style_circles)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(isBuySignal, title="Buy Signal", message="MasterScalpTrader: BUY Signal - Confidence: {{plot_0}}%")
+alertcondition(isSellSignal, title="Sell Signal", message="MasterScalpTrader: SELL Signal - Confidence: {{plot_0}}%")
+alertcondition(isBuySignal or isSellSignal, title="Any Signal", message="MasterScalpTrader: Signal Detected")
+alertcondition(isLongExit, title="Long Exit", message="MasterScalpTrader: EXIT Long Position - Price hit exit line")
+alertcondition(isShortExit, title="Short Exit", message="MasterScalpTrader: EXIT Short Position - Price hit exit line")
+alertcondition(isLongExit or isShortExit, title="Any Exit", message="MasterScalpTrader: EXIT Signal - Close Position")
+
+// ============================================================================
+// BACKGROUND COLOR (Optional trend visualization)
+// ============================================================================
+
+bgcolor(buyCondCore and not longEligible ? color.new(color.green, 95) : na, title="Potential Buy Zone")
+bgcolor(sellCondCore and not shortEligible ? color.new(color.red, 95) : na, title="Potential Sell Zone")
+
+// ============================================================================
+// TABLE - CURRENT MARKET STATUS
+// ============================================================================
+
+var table statusTable = table.new(position.top_right, 2, 8, border_width=1)
+
+if barstate.islast
+    table.cell(statusTable, 0, 0, "Status", bgcolor=color.new(color.gray, 50), text_color=color.white)
+    table.cell(statusTable, 1, 0, "Value", bgcolor=color.new(color.gray, 50), text_color=color.white)
+    
+    table.cell(statusTable, 0, 1, "Signal", text_color=color.white)
+    table.cell(statusTable, 1, 1, 
+               finalSignal == 1 ? "BUY" : finalSignal == -1 ? "SELL" : "WAITING", 
+               bgcolor=finalSignal == 1 ? buy_color : finalSignal == -1 ? sell_color : color.gray,
+               text_color=color.white)
+    
+    table.cell(statusTable, 0, 2, "Confidence", text_color=color.white)
+    table.cell(statusTable, 1, 2, str.tostring(finalConfidence) + "%", text_color=color.white)
+    
+    table.cell(statusTable, 0, 3, "Triggers", text_color=color.white)
+    table.cell(statusTable, 1, 3, 
+               str.tostring(finalSignal == 1 ? longTriggers : finalSignal == -1 ? shortTriggers : 0) + "/6", 
+               text_color=color.white)
+    
+    table.cell(statusTable, 0, 4, "RSI", text_color=color.white)
+    table.cell(statusTable, 1, 4, str.tostring(math.round(rsi, 1)), text_color=color.white)
+    
+    table.cell(statusTable, 0, 5, "MACD Hist", text_color=color.white)
+    table.cell(statusTable, 1, 5, str.tostring(math.round(macdHist, 4)), text_color=color.white)
+    
+    table.cell(statusTable, 0, 6, "Trend", text_color=color.white)
+    table.cell(statusTable, 1, 6, 
+               bullTrend ? "BULL" : bearTrend ? "BEAR" : "NEUTRAL",
+               bgcolor=bullTrend ? color.new(color.green, 70) : bearTrend ? color.new(color.red, 70) : color.new(color.gray, 70),
+               text_color=color.white)
+    
+    table.cell(statusTable, 0, 7, "Volume", text_color=color.white)
+    table.cell(statusTable, 1, 7, 
+               volSpike ? "SPIKE" : "NORMAL",
+               bgcolor=volSpike ? color.new(color.orange, 70) : color.new(color.gray, 70),
+               text_color=color.white)
